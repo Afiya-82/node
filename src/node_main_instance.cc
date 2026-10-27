@@ -13,6 +13,7 @@
 #include "node_snapshot_builder.h"
 #include "node_snapshotable.h"
 #include "node_v8_platform-inl.h"
+#include "node_watchdog.h"
 #include "util-inl.h"
 #if defined(LEAK_SANITIZER)
 #include <sanitizer/lsan_interface.h>
@@ -51,13 +52,11 @@ NodeMainInstance::NodeMainInstance(const SnapshotData* snapshot_data,
 
   // If the indexes are not nullptr, we are not deserializing
   isolate_data_.reset(
-      CreateIsolateData(isolate_,
-                        event_loop,
-                        platform,
-                        array_buffer_allocator_.get(),
-                        snapshot_data->AsEmbedderWrapper().get()));
-  isolate_data_->set_is_building_snapshot(
-      per_process::cli_options->per_isolate->build_snapshot);
+      IsolateData::CreateIsolateData(isolate_,
+                                     event_loop,
+                                     platform,
+                                     array_buffer_allocator_.get(),
+                                     snapshot_data));
 
   isolate_data_->max_young_gen_size =
       isolate_params_->constraints.max_young_generation_size_in_bytes();
@@ -67,11 +66,24 @@ NodeMainInstance::~NodeMainInstance() {
   if (isolate_params_ == nullptr) {
     return;
   }
-  // This should only be done on a main instance that owns its isolate.
-  // IsolateData must be freed before UnregisterIsolate() is called.
-  isolate_data_.reset();
-  platform_->UnregisterIsolate(isolate_);
-  isolate_->Dispose();
+
+  {
+#ifdef DEBUG
+    // node::Environment has been disposed and no JavaScript Execution is
+    // allowed at this point.
+    // Create a scope to check that no JavaScript is executed in debug build
+    // and proactively crash the process in the case JavaScript is being
+    // executed.
+    // Isolate::Dispose() must be invoked outside of this scope to avoid
+    // use-after-free.
+    Isolate::DisallowJavascriptExecutionScope disallow_js(
+        isolate_, Isolate::DisallowJavascriptExecutionScope::CRASH_ON_FAILURE);
+#endif
+    // This should only be done on a main instance that owns its isolate.
+    // IsolateData must be freed before UnregisterIsolate() is called.
+    isolate_data_.reset();
+  }
+  platform_->DisposeIsolate(isolate_);
 }
 
 ExitCode NodeMainInstance::Run() {
@@ -80,32 +92,26 @@ ExitCode NodeMainInstance::Run() {
   HandleScope handle_scope(isolate_);
 
   ExitCode exit_code = ExitCode::kNoFailure;
+  // Declared before the Environment so that --process-timeout still applies
+  // while the Environment is being freed.
+  std::unique_ptr<ProcessTimeoutWatchdog> process_timeout;
   DeleteFnPtr<Environment, FreeEnvironment> env =
       CreateMainEnvironment(&exit_code);
   CHECK_NOT_NULL(env);
 
   Context::Scope context_scope(env->context());
+  if (exit_code == ExitCode::kNoFailure) {
+    process_timeout = ProcessTimeoutWatchdog::MaybeStart(env.get());
+  }
   Run(&exit_code, env.get());
+  if (process_timeout) process_timeout->OnEnvironmentStopping();
   return exit_code;
 }
 
 void NodeMainInstance::Run(ExitCode* exit_code, Environment* env) {
   if (*exit_code == ExitCode::kNoFailure) {
-    bool runs_sea_code = false;
-#ifndef DISABLE_SINGLE_EXECUTABLE_APPLICATION
-    if (sea::IsSingleExecutable()) {
-      sea::SeaResource sea = sea::FindSingleExecutableResource();
-      if (!sea.use_snapshot()) {
-        runs_sea_code = true;
-        std::string_view code = sea.main_code_or_snapshot;
-        LoadEnvironment(env, code);
-      }
-    }
-#endif
-    // Either there is already a snapshot main function from SEA, or it's not
-    // a SEA at all.
-    if (!runs_sea_code) {
-      LoadEnvironment(env, StartExecutionCallback{});
+    if (!sea::MaybeLoadSingleExecutableApplication(env)) {
+      LoadEnvironment(env, StartExecutionCallbackWithModule{});
     }
 
     *exit_code =

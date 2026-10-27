@@ -22,12 +22,19 @@ const server = tls.createServer({
   cert: fixtures.readKey('agent1-cert.pem'),
 })
   .listen(client)
-  .on('secureConnection', (serverTlsSock) => {
-    serverTlsSock.on('data', (chunk) => {
-      assert.strictEqual(chunk.toString(), HEAD);
+  .on('secureConnection', common.mustCall((serverTlsSock) => {
+    serverTlsSock.once('data', common.mustCall((chunk) => {
+      assert.strictEqual(chunk.toString('latin1', 0, HEAD.length), HEAD);
+      // The start of the inner handshake can arrive in the same chunk as
+      // HEAD. Put it back so that the inner TLSSocket, which reads whatever
+      // is buffered on the socket it wraps, receives it.
+      if (chunk.length > HEAD.length) {
+        serverTlsSock.pause();
+        serverTlsSock.unshift(chunk.subarray(HEAD.length));
+      }
       subserver.emit('connection', serverTlsSock);
-    });
-  });
+    }));
+  }));
 
 function client() {
   const down = tls.connect({

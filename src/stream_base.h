@@ -10,6 +10,8 @@
 
 #include "v8.h"
 
+#include <climits>  // INT_MIN
+
 namespace node {
 
 // Forward declarations
@@ -37,7 +39,7 @@ class StreamReq {
   // BaseObject, and the slots are used for the identical purpose.
   enum InternalFields {
     kSlot = BaseObject::kSlot,
-    kStreamReqField = BaseObject::kInternalFieldCount,
+    kStreamReqField = AsyncWrap::kInternalFieldCount,
     kInternalFieldCount
   };
 
@@ -244,6 +246,8 @@ class StreamResource {
   // `*bufs` and `*count` accordingly. This is a no-op by default.
   // Return 0 for success and a libuv error code for failures.
   virtual int DoTryWrite(uv_buf_t** bufs, size_t* count);
+  // Indicates whether this subclass overrides the DoTryWrite
+  virtual inline bool HasDoTryWrite() const { return false; }
   // Initiate a write of data.
   // Upon an immediate failure, a libuv error code is returned,
   // w->Done() will never be called and caller should free `bufs`.
@@ -308,7 +312,7 @@ class StreamBase : public StreamResource {
   // BaseObject (it's possible for it not to, however).
   enum InternalFields {
     kSlot = BaseObject::kSlot,
-    kStreamBaseField = BaseObject::kInternalFieldCount,
+    kStreamBaseField = AsyncWrap::kInternalFieldCount,
     kOnReadFunctionField,
     kInternalFieldCount
   };
@@ -403,14 +407,29 @@ class StreamBase : public StreamResource {
     kArrayBufferOffset,
     kBytesWritten,
     kLastWriteWasAsync,
+    kLastWriteErr,
     kNumStreamBaseStateFields
   };
 
  private:
+  // Sentinel return value for JS methods that have set their own (object)
+  // return value and must not have it overwritten by JSMethod().
+  static constexpr int kReturnValueSet = INT_MIN;
+
   Environment* env_;
   EmitToJSStreamListener default_listener_;
 
   void SetWriteResult(const StreamWriteResult& res);
+  int FinishWrite(const v8::FunctionCallbackInfo<v8::Value>& args,
+                  const StreamWriteResult& res,
+                  bool lazy_req);
+  static void AddAccessor(v8::Isolate* isolate,
+                          v8::Local<v8::Signature> sig,
+                          enum v8::PropertyAttribute attributes,
+                          v8::Local<v8::FunctionTemplate> t,
+                          JSMethodFunction* getter,
+                          JSMethodFunction* setter,
+                          v8::Local<v8::String> str);
   static void AddMethod(v8::Isolate* isolate,
                         v8::Local<v8::Signature> sig,
                         enum v8::PropertyAttribute attributes,
@@ -423,14 +442,18 @@ class StreamBase : public StreamResource {
   friend class Environment;  // For kNumStreamBaseStateFields.
 };
 
-
 // These are helpers for creating `ShutdownWrap`/`WriteWrap` instances.
 // `OtherBase` must have a constructor that matches the `AsyncWrap`
-// constructors’s (Environment*, Local<Object>, AsyncWrap::Provider) signature
+// constructors's (Environment*, Local<Object>, AsyncWrap::Provider) signature
 // and be a subclass of `AsyncWrap`.
-template <typename OtherBase>
+template <std::derived_from<AsyncWrap> OtherBase>
 class SimpleShutdownWrap : public ShutdownWrap, public OtherBase {
  public:
+  enum InternalFields {
+    kInternalFieldCount = std::max<uint32_t>(ShutdownWrap::kInternalFieldCount,
+                                             OtherBase::kInternalFieldCount),
+  };
+
   SimpleShutdownWrap(StreamBase* stream,
                      v8::Local<v8::Object> req_wrap_obj);
 
@@ -445,9 +468,14 @@ class SimpleShutdownWrap : public ShutdownWrap, public OtherBase {
   }
 };
 
-template <typename OtherBase>
+template <std::derived_from<AsyncWrap> OtherBase>
 class SimpleWriteWrap : public WriteWrap, public OtherBase {
  public:
+  enum InternalFields {
+    kInternalFieldCount = std::max<uint32_t>(WriteWrap::kInternalFieldCount,
+                                             OtherBase::kInternalFieldCount),
+  };
+
   SimpleWriteWrap(StreamBase* stream,
                   v8::Local<v8::Object> req_wrap_obj);
 

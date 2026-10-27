@@ -20,3 +20,5 @@ prefix benchmark
 
 [$arch==arm]
 
+[$system==ibmi]
+test-benchmark-websocket: SKIP

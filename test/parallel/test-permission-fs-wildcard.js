@@ -1,8 +1,12 @@
-// Flags: --experimental-permission --allow-fs-read=* --allow-child-process
+// Flags: --permission --allow-fs-read=* --allow-child-process
 'use strict';
 
 const common = require('../common');
-common.skipIfWorker();
+const { isMainThread } = require('worker_threads');
+
+if (!isMainThread) {
+  common.skip('This test only works on a main thread');
+}
 
 const assert = require('assert');
 const path = require('path');
@@ -31,7 +35,7 @@ if (common.isWindows) {
   const { status, stderr } = spawnSync(
     process.execPath,
     [
-      '--experimental-permission',
+      '--permission',
       ...allowList.flatMap((path) => ['--allow-fs-read', path]),
       '-e',
       `
@@ -66,7 +70,7 @@ if (common.isWindows) {
   const { status, stderr } = spawnSync(
     process.execPath,
     [
-      '--experimental-permission',
+      '--permission',
       ...allowList.flatMap((path) => ['--allow-fs-read', path]),
       '-e',
       `
@@ -91,10 +95,65 @@ if (common.isWindows) {
   const { status, stderr } = spawnSync(
     process.execPath,
     [
-      '--experimental-permission',
+      '--permission',
       `--allow-fs-read=${file}`, `--allow-fs-read=${commonPathWildcard}`, ...allowList.flatMap((path) => ['--allow-fs-read', path]),
       file,
     ],
   );
   assert.strictEqual(status, 0, stderr.toString());
+}
+
+{
+  if (!common.isWindows) {
+    const { status, stderr } = spawnSync(
+      process.execPath,
+      [
+        '--permission',
+        '--allow-fs-read=/a/b/*',
+        '--allow-fs-read=/a/b/d',
+        '--allow-fs-read=/etc/passwd.*',
+        '--allow-fs-read=/home/*.js',
+        '-e',
+        `
+        const assert = require('assert')
+        assert.ok(process.permission.has('fs.read', '/a/b/c'));
+        assert.ok(!process.permission.has('fs.read', '/a/c/c'));
+        assert.ok(!process.permission.has('fs.read', '/etc/passwd'));
+        assert.ok(process.permission.has('fs.read', '/home/another-file.md'));
+      `,
+      ]
+    );
+    assert.strictEqual(status, 0, stderr.toString());
+  }
+}
+
+{
+  // Each scope holds a single grant, so its wildcard node sits directly under
+  // the radix tree root. Removing the `*` and the character before it must not
+  // produce a granted path.
+  if (!common.isWindows) {
+    const { status, stderr } = spawnSync(
+      process.execPath,
+      [
+        '--permission',
+        '--allow-fs-read=/tmp/test*',
+        '--allow-fs-write=/tmp/test/*',
+        '-e',
+        `
+        const assert = require('assert');
+        assert.ok(process.permission.has('fs.read', '/tmp/test'));
+        assert.ok(process.permission.has('fs.read', '/tmp/test2'));
+        assert.ok(process.permission.has('fs.read', '/tmp/test/file'));
+        assert.ok(!process.permission.has('fs.read', '/tmp/tes'));
+        assert.ok(!process.permission.has('fs.read', '/tmp/te'));
+        assert.ok(process.permission.has('fs.write', '/tmp/test'));
+        assert.ok(process.permission.has('fs.write', '/tmp/test/'));
+        assert.ok(process.permission.has('fs.write', '/tmp/test/file'));
+        assert.ok(!process.permission.has('fs.write', '/tmp/tes'));
+        assert.ok(!process.permission.has('fs.write', '/tmp/test2'));
+      `,
+      ]
+    );
+    assert.strictEqual(status, 0, stderr.toString());
+  }
 }

@@ -9,7 +9,7 @@ const util = require('util');
 // run the function with those settings.
 // if not, then queue up a bunch of child processes.
 const bench = common.createBenchmark(main, {
-  len: [102400, 1024 * 1024 * 16],
+  len: [102400, 1024 * 64 * 16],
   type: ['utf', 'asc', 'buf'],
   dur: [5],
 }, {
@@ -23,7 +23,12 @@ function main({ dur, len, type }) {
     TCPConnectWrap,
     constants: TCPConstants,
   } = common.binding('tcp_wrap');
-  const { WriteWrap } = common.binding('stream_wrap');
+  const {
+    WriteWrap,
+    kReadBytesOrError,
+    kArrayBufferOffset,
+    streamBaseState,
+  } = common.binding('stream_wrap');
   const PORT = common.PORT;
 
   function fail(err, syscall) {
@@ -50,9 +55,11 @@ function main({ dur, len, type }) {
       if (!buffer)
         fail('read');
 
+      const nread = streamBaseState[kReadBytesOrError];
+      const offset = streamBaseState[kArrayBufferOffset];
       const writeReq = new WriteWrap();
       writeReq.async = false;
-      err = clientHandle.writeBuffer(writeReq, Buffer.from(buffer));
+      err = clientHandle.writeBuffer(writeReq, Buffer.from(buffer, offset, nread));
 
       if (err)
         fail(err, 'write');
@@ -94,7 +101,7 @@ function main({ dur, len, type }) {
     if (!buffer)
       fail('read');
 
-    bytes += buffer.byteLength;
+    bytes += streamBaseState[kReadBytesOrError];
   };
 
   connectReq.oncomplete = function(err) {

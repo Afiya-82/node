@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <limits>
+#include <optional>
 
 #include "src/base/container-utils.h"
 #include "src/base/export-template.h"
@@ -119,27 +120,35 @@ struct Payload_OutlineSet {
 }  // namespace detail
 
 template <typename T>
-std::enable_if_t<std::is_floating_point<T>::value, T> next_smaller(T v) {
+T next_smaller(T v)
+  requires std::is_floating_point_v<T>
+{
   DCHECK(!std::isnan(v));
   DCHECK_LT(-std::numeric_limits<T>::infinity(), v);
   return std::nextafter(v, -std::numeric_limits<T>::infinity());
 }
 
 template <typename T>
-std::enable_if_t<std::is_floating_point<T>::value, T> next_larger(T v) {
+T next_larger(T v)
+  requires std::is_floating_point_v<T>
+{
   DCHECK(!std::isnan(v));
   DCHECK_LT(v, std::numeric_limits<T>::infinity());
   return std::nextafter(v, std::numeric_limits<T>::infinity());
 }
 
 template <typename T>
-std::enable_if_t<std::is_integral<T>::value, T> next_smaller(T v) {
+T next_smaller(T v)
+  requires std::is_integral_v<T>
+{
   DCHECK_LT(std::numeric_limits<T>::min(), v);
   return v - 1;
 }
 
 template <typename T>
-std::enable_if_t<std::is_integral<T>::value, T> next_larger(T v) {
+T next_larger(T v)
+  requires std::is_integral_v<T>
+{
   DCHECK_LT(v, std::numeric_limits<T>::max());
   return v + 1;
 }
@@ -208,18 +217,20 @@ class V8_EXPORT_PRIVATE Type {
   template <size_t B>
   inline bool IsWord() const {
     static_assert(B == 32 || B == 64);
-    if constexpr (B == 32)
+    if constexpr (B == 32) {
       return IsWord32();
-    else
+    } else {
       return IsWord64();
+    }
   }
   template <size_t B>
   inline bool IsFloat() const {
     static_assert(B == 32 || B == 64);
-    if constexpr (B == 32)
+    if constexpr (B == 32) {
       return IsFloat32();
-    else
+    } else {
       return IsFloat64();
+    }
   }
 
   // Casts
@@ -231,18 +242,20 @@ class V8_EXPORT_PRIVATE Type {
   template <size_t B>
   inline const auto& AsWord() const {
     static_assert(B == 32 || B == 64);
-    if constexpr (B == 32)
+    if constexpr (B == 32) {
       return AsWord32();
-    else
+    } else {
       return AsWord64();
+    }
   }
   template <size_t B>
   inline const auto& AsFloat() const {
     static_assert(B == 32 || B == 64);
-    if constexpr (B == 32)
+    if constexpr (B == 32) {
       return AsFloat32();
-    else
+    } else {
       return AsFloat64();
+    }
   }
 
   // Comparison
@@ -260,8 +273,8 @@ class V8_EXPORT_PRIVATE Type {
 
   // Other functions
   static Type LeastUpperBound(const Type& lhs, const Type& rhs, Zone* zone);
-  static base::Optional<Type> ParseFromString(const std::string_view& str,
-                                              Zone* zone);
+  static std::optional<Type> ParseFromString(const std::string_view& str,
+                                             Zone* zone);
   Handle<TurboshaftType> AllocateOnHeap(Factory* factory) const;
 
  protected:
@@ -361,17 +374,14 @@ class WordType : public Type {
   template <size_t N>
   static WordType Set(const base::SmallVector<word_t, N>& elements,
                       Zone* zone) {
-    return Set(base::Vector<const word_t>{elements.data(), elements.size()},
-               zone);
+    return Set(base::VectorOf(elements), zone);
   }
   static WordType Set(const std::vector<word_t>& elements, Zone* zone) {
-    return Set(base::Vector<const word_t>{elements.data(), elements.size()},
-               zone);
+    return Set(base::VectorOf(elements), zone);
   }
   static WordType Set(const std::initializer_list<word_t>& elements,
                       Zone* zone) {
-    return Set(base::Vector<const word_t>{elements.begin(), elements.size()},
-               zone);
+    return Set(base::VectorOf(elements), zone);
   }
   static WordType Set(base::Vector<const word_t> elements, Zone* zone) {
     DCHECK(detail::is_unique_and_sorted(elements));
@@ -388,6 +398,11 @@ class WordType : public Type {
       return WordType{SubKind::kSet, static_cast<uint8_t>(elements.size()), p};
     } else {
       // Allocate storage in the zone.
+#if defined(__GNUC__) && !defined(__clang__)
+      // Work around a spurious GCC-12 warning. The DCHECK above already
+      // checks the right precondition.
+      if (zone == nullptr) return WordType::Any();
+#endif
       Payload_OutlineSet p;
       p.array = zone->AllocateArray<word_t>(elements.size());
       DCHECK_NOT_NULL(p.array);
@@ -440,8 +455,8 @@ class WordType : public Type {
                                         set_size());
     }
   }
-  base::Optional<word_t> try_get_constant() const {
-    if (!is_constant()) return base::nullopt;
+  std::optional<word_t> try_get_constant() const {
+    if (!is_constant()) return std::nullopt;
     DCHECK(is_set());
     DCHECK_EQ(set_size(), 1);
     return set_element(0);
@@ -457,6 +472,7 @@ class WordType : public Type {
       case SubKind::kSet:
         return set_element(0);
     }
+    UNREACHABLE();
   }
   word_t unsigned_max() const {
     switch (sub_kind()) {
@@ -466,6 +482,7 @@ class WordType : public Type {
         DCHECK_GE(set_size(), 1);
         return set_element(set_size() - 1);
     }
+    UNREACHABLE();
   }
 
   // Misc
@@ -559,21 +576,18 @@ class FloatType : public Type {
   template <size_t N>
   static FloatType Set(const base::SmallVector<float_t, N>& elements,
                        uint32_t special_values, Zone* zone) {
-    return Set(base::Vector<const float_t>{elements.data(), elements.size()},
-               special_values, zone);
+    return Set(base::VectorOf(elements), special_values, zone);
   }
   static FloatType Set(const std::initializer_list<float_t>& elements,
                        uint32_t special_values, Zone* zone) {
-    return Set(base::Vector<const float_t>{elements.begin(), elements.size()},
-               special_values, zone);
+    return Set(base::VectorOf(elements), special_values, zone);
   }
   static FloatType Set(const std::vector<float_t>& elements, Zone* zone) {
     return Set(elements, Special::kNoSpecialValues, zone);
   }
   static FloatType Set(const std::vector<float_t>& elements,
                        uint32_t special_values, Zone* zone) {
-    return Set(base::Vector<const float_t>{elements.data(), elements.size()},
-               special_values, zone);
+    return Set(base::VectorOf(elements), special_values, zone);
   }
   static FloatType Set(base::Vector<const float_t> elements,
                        uint32_t special_values, Zone* zone) {
@@ -688,6 +702,7 @@ class FloatType : public Type {
         if (has_minus_zero()) return std::min(float_t{-0.0}, set_element(0));
         return set_element(0);
     }
+    UNREACHABLE();
   }
   float_t max() const {
     switch (sub_kind()) {
@@ -704,10 +719,11 @@ class FloatType : public Type {
         }
         return set_element(set_size() - 1);
     }
+    UNREACHABLE();
   }
   std::pair<float_t, float_t> minmax() const { return {min(), max()}; }
-  base::Optional<float_t> try_get_constant() const {
-    if (!is_constant()) return base::nullopt;
+  std::optional<float_t> try_get_constant() const {
+    if (!is_constant()) return std::nullopt;
     DCHECK(is_set());
     DCHECK_EQ(set_size(), 1);
     return set_element(0);
@@ -729,6 +745,7 @@ class FloatType : public Type {
       case SubKind::kSet:
         return set_element(0);
     }
+    UNREACHABLE();
   }
   // Returns the maximum value of a range or set, ignoring any special values
   // (in contrast to max() above).
@@ -741,6 +758,7 @@ class FloatType : public Type {
       case SubKind::kSet:
         return set_element(set_size() - 1);
     }
+    UNREACHABLE();
   }
   std::pair<float_t, float_t> range_or_set_minmax() const {
     return {range_or_set_min(), range_or_set_max()};
@@ -831,8 +849,7 @@ class TupleType : public Type {
     return get_payload<Payload>().array[index];
   }
   base::Vector<Type> elements() const {
-    return base::Vector<Type>{get_payload<Payload>().array,
-                              static_cast<size_t>(size())};
+    return {get_payload<Payload>().array, static_cast<size_t>(size())};
   }
 
   // Misc
@@ -894,6 +911,7 @@ inline std::ostream& operator<<(std::ostream& stream, Type::Kind kind) {
     case Type::Kind::kAny:
       return stream << "Any";
   }
+  UNREACHABLE();
 }
 
 inline std::ostream& operator<<(std::ostream& stream, const Type& type) {

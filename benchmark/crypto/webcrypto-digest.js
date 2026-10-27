@@ -8,7 +8,7 @@ const bench = common.createBenchmark(main, {
   sync: ['createHash', 'subtle'],
   data: [10, 20, 50, 100],
   method: ['SHA-1', 'SHA-256', 'SHA-384', 'SHA-512'],
-  n: [1e3],
+  n: [1e5],
 });
 
 const kMethods = {
@@ -33,8 +33,6 @@ function measureLegacy(n, data, method) {
 }
 
 function measureSubtle(n, data, method) {
-  const ec = new TextEncoder();
-  data = ec.encode(data);
   const jobs = new Array(n);
   bench.start();
   for (let i = 0; i < n; i++)

@@ -6,7 +6,9 @@
 #define V8_HEAP_PRETENURING_HANDLER_H_
 
 #include <memory>
+#include <unordered_map>
 
+#include "src/heap/pending-allocations.h"
 #include "src/objects/allocation-site.h"
 #include "src/objects/heap-object.h"
 #include "src/objects/map.h"
@@ -23,7 +25,7 @@ class PretenuringHandler final {
   static constexpr int kInitialFeedbackCapacity = 256;
 
   using PretenuringFeedbackMap =
-      std::unordered_map<AllocationSite, size_t, Object::Hasher>;
+      std::unordered_map<Tagged<AllocationSite>, size_t, Object::Hasher>;
   enum FindMementoMode { kForRuntime, kForGC };
 
   explicit PretenuringHandler(Heap* heap);
@@ -34,8 +36,15 @@ class PretenuringHandler final {
   // If an object has an AllocationMemento trailing it, return it, otherwise
   // return a null AllocationMemento.
   template <FindMementoMode mode>
-  inline Tagged<AllocationMemento> FindAllocationMemento(
-      Tagged<Map> map, Tagged<HeapObject> object);
+  static inline Tagged<AllocationMemento> FindAllocationMemento(
+      Heap* heap, Tagged<Map> map, Tagged<HeapObject> object,
+      const YoungPendingAllocations::Snapshot*
+          young_pending_allocations_snapshot = nullptr);
+  template <FindMementoMode mode>
+  static inline Tagged<AllocationMemento> FindAllocationMemento(
+      Heap* heap, Tagged<Map> map, Tagged<HeapObject> object, int object_size,
+      const YoungPendingAllocations::Snapshot*
+          young_pending_allocations_snapshot = nullptr);
 
   // ===========================================================================
   // Allocation site tracking. =================================================
@@ -43,9 +52,17 @@ class PretenuringHandler final {
 
   // Updates the AllocationSite of a given {object}. The entry (including the
   // count) is cached on the local pretenuring feedback.
-  inline void UpdateAllocationSite(
-      Tagged<Map> map, Tagged<HeapObject> object,
-      PretenuringFeedbackMap* pretenuring_feedback);
+  static inline void UpdateAllocationSite(
+      Heap* heap, Tagged<Map> map, Tagged<HeapObject> object, int object_size,
+      PretenuringFeedbackMap* pretenuring_feedback,
+      const YoungPendingAllocations::Snapshot*
+          young_pending_allocations_snapshot = nullptr);
+  static inline void UpdateAllocationSite(
+      Heap* heap, Tagged<Map> map, Tagged<HeapObject> object,
+      SafeHeapObjectSize object_size,
+      PretenuringFeedbackMap* pretenuring_feedback,
+      const YoungPendingAllocations::Snapshot*
+          young_pending_allocations_snapshot = nullptr);
 
   // Merges local pretenuring feedback into the global one. Note that this
   // method needs to be called after evacuation, as allocation sites may be

@@ -2,13 +2,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "src/compiler/decompression-optimizer.h"
-
 #include "test/unittests/compiler/graph-unittest.h"
 
 namespace v8 {
 namespace internal {
 namespace compiler {
+
+// TODO(391750831): This needs to be ported to Turboshaft.
+#if 0
 
 class DecompressionOptimizerTest : public GraphTest {
  public:
@@ -251,9 +252,13 @@ TEST_F(DecompressionOptimizerTest, TypedStateValues) {
           constant_1);
       Node* constant_2 =
           graph()->NewNode(common()->HeapConstant(heap_constants[j]));
+      FrameStateFunctionInfo const* function_info =
+          common()->CreateFrameStateFunctionInfo(
+              FrameStateType::kUnoptimizedFunction, 0, 0, 0, {}, {});
       graph()->SetEnd(graph()->NewNode(
           common()->FrameState(BytecodeOffset::None(),
-                               OutputFrameStateCombine::Ignore(), nullptr),
+                               OutputFrameStateCombine::Ignore(),
+                               function_info),
           typed_state_values, typed_state_values, typed_state_values,
           constant_2, UndefinedConstant(), graph()->start()));
 
@@ -488,6 +493,7 @@ TEST_F(DecompressionOptimizerTest, BitcastTaggedToWordForTagAndSmiBits) {
     }
   }
 }
+#endif
 
 }  // namespace compiler
 }  // namespace internal

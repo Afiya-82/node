@@ -6,12 +6,13 @@
 
 #include "src/api/api-inl.h"
 #include "src/handles/global-handles-inl.h"
-#include "src/heap/cppgc/heap-page.h"
+#include "src/heap/cppgc-internal/heap-page.h"
 
 namespace v8::internal {
 
 void CrossHeapRememberedSet::RememberReferenceIfNeeded(
-    Isolate& isolate, Tagged<JSObject> host_obj, void* cppgc_object) {
+    Isolate& isolate, Tagged<CppHeapPointerWrapperObjectT> host_obj,
+    void* cppgc_object) {
   DCHECK_NOT_NULL(cppgc_object);
   // Any in-cage pointer must point to a vaild, not freed cppgc object.
   auto* page =

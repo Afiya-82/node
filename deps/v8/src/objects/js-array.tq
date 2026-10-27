@@ -4,6 +4,7 @@
 
 extern enum IterationKind extends uint31 { kKeys, kValues, kEntries }
 
+@cppObjectLayoutDefinition
 extern class JSArrayIterator extends JSObject {
   iterated_object: JSReceiver;
 
@@ -35,7 +36,7 @@ extern class JSArrayIterator extends JSObject {
   kind: SmiTagged<IterationKind>;
 }
 
-// Perform CreateArrayIterator (ES #sec-createarrayiterator).
+// https://tc39.es/ecma262/#sec-createarrayiterator
 @export
 macro CreateArrayIterator(
     implicit context: NativeContext)(array: JSReceiver,
@@ -50,7 +51,7 @@ macro CreateArrayIterator(
   };
 }
 
-// Perform CreateArrayIterator (ES #sec-createarrayiterator).
+// https://tc39.es/ecma262/#sec-createarrayiterator
 @export
 macro CreateArrayIterator(
     implicit context: NativeContext)(array: JSReceiver,
@@ -58,6 +59,7 @@ macro CreateArrayIterator(
   return CreateArrayIterator(array, kind, 0);
 }
 
+@cppObjectLayoutDefinition
 extern class JSArray extends JSObject {
   macro IsEmpty(): bool {
     return this.length == 0;
@@ -67,6 +69,7 @@ extern class JSArray extends JSObject {
 
 @hasSameInstanceTypeAsParent
 @doNotGenerateCast
+@cppObjectLayoutDefinition
 extern class TemplateLiteralObject extends JSArray {
   raw: JSArray;
   function_literal_id: Smi;
@@ -74,8 +77,8 @@ extern class TemplateLiteralObject extends JSArray {
 }
 
 @doNotGenerateCast
-extern class JSArrayConstructor extends JSFunction
-    generates 'TNode<JSFunction>';
+extern class JSArrayConstructor extends JSFunctionWithPrototype
+    generates 'JSFunction';
 
 macro NewJSArray(
     implicit context: Context)(map: Map, elements: FixedArrayBase): JSArray {
@@ -83,7 +86,7 @@ macro NewJSArray(
     map,
     properties_or_hash: kEmptyFixedArray,
     elements,
-    length: elements.length
+    length: Convert<Smi>(elements.length)
   };
 }
 
@@ -134,6 +137,10 @@ transient type FastJSArrayWithNoCustomIteration extends FastJSArray;
 transient type FastJSArrayForReadWithNoCustomIteration extends
     FastJSArrayForRead;
 
+// A HeapObject with a JSArray map, no named properties except "length" and
+// unmodified initial Array.prototype.
+transient type JSArrayForFastToString extends JSArray;
+
 extern macro AllocateJSArray(
     constexpr ElementsKind, Map, intptr, Smi,
     constexpr AllocationFlag): JSArray;
@@ -141,6 +148,9 @@ extern macro AllocateJSArray(
     constexpr ElementsKind, Map, intptr, Smi): JSArray;
 extern macro AllocateJSArray(constexpr ElementsKind, Map, Smi, Smi): JSArray;
 extern macro AllocateJSArray(Map, FixedArrayBase, Smi): JSArray;
+extern macro AllocateJSArrayFolded(
+    constexpr ElementsKind, Map, Smi, Smi): JSArray
+    labels Bailout;
 
 macro LoadElementNoHole<T : type extends FixedArrayBase>(
     a: JSArray, index: Smi): JSAny
@@ -167,8 +177,14 @@ LoadElementNoHole<FixedDoubleArray>(
     labels IfHole {
   const elements: FixedDoubleArray =
       Cast<FixedDoubleArray>(a.elements) otherwise unreachable;
-  const e: float64 = elements.floats[index].Value() otherwise IfHole;
-  return AllocateHeapNumberWithValue(e);
+  try {
+    const e: float64 = elements.values[index].Value() otherwise IfUndefined,
+             IfHole;
+    return AllocateHeapNumberWithValue(e);
+  } label IfUndefined {
+    dcheck(kEnableUndefinedDouble);
+    return Undefined;
+  }
 }
 
 extern builtin ExtractFastJSArray(Context, JSArray, Smi, Smi): JSArray;
@@ -246,7 +262,7 @@ struct FastJSArrayWitness {
     if (this.hasDoubles) {
       const elements = Cast<FixedDoubleArray>(this.unstable.elements)
           otherwise unreachable;
-      elements.floats[k] = kDoubleHole;
+      elements.values[k] = kDoubleHole;
     } else {
       const elements = Cast<FixedArray>(this.unstable.elements)
           otherwise unreachable;
@@ -276,9 +292,22 @@ struct FastJSArrayWitness {
   macro Push(value: JSAny): void labels Failed {
     dcheck(this.arrayIsPushable);
     if (this.hasDoubles) {
-      BuildAppendJSArray(
-          ElementsKind::HOLEY_DOUBLE_ELEMENTS, this.unstable, value)
-          otherwise Failed;
+      @if(V8_ENABLE_UNDEFINED_DOUBLE) {
+        if (this.hasDoubleHoles) {
+          BuildAppendJSArray(
+              ElementsKind::HOLEY_DOUBLE_ELEMENTS, this.unstable, value)
+              otherwise Failed;
+        } else {
+          BuildAppendJSArray(
+              ElementsKind::PACKED_DOUBLE_ELEMENTS, this.unstable, value)
+              otherwise Failed;
+        }
+      }
+      @ifnot(V8_ENABLE_UNDEFINED_DOUBLE) {
+        BuildAppendJSArray(
+            ElementsKind::PACKED_DOUBLE_ELEMENTS, this.unstable, value)
+            otherwise Failed;
+      }
     } else if (this.hasSmis) {
       BuildAppendJSArray(ElementsKind::HOLEY_SMI_ELEMENTS, this.unstable, value)
           otherwise Failed;
@@ -313,21 +342,36 @@ struct FastJSArrayWitness {
   unstable: FastJSArray;
   const map: Map;
   const hasDoubles: bool;
+  @if(V8_ENABLE_UNDEFINED_DOUBLE) const hasDoubleHoles: bool;
   const hasSmis: bool;
   arrayIsPushable: bool;
 }
 
 macro NewFastJSArrayWitness(array: FastJSArray): FastJSArrayWitness {
   const kind = array.map.elements_kind;
-  return FastJSArrayWitness{
-    stable: array,
-    unstable: array,
-    map: array.map,
-    hasDoubles: IsDoubleElementsKind(kind),
-    hasSmis:
-        IsElementsKindLessThanOrEqual(kind, ElementsKind::HOLEY_SMI_ELEMENTS),
-    arrayIsPushable: false
-  };
+  @if(V8_ENABLE_UNDEFINED_DOUBLE) {
+    return FastJSArrayWitness{
+      stable: array,
+      unstable: array,
+      map: array.map,
+      hasDoubles: IsDoubleElementsKind(kind),
+      hasDoubleHoles: (kind == ElementsKind::HOLEY_DOUBLE_ELEMENTS),
+      hasSmis:
+          IsElementsKindLessThanOrEqual(kind, ElementsKind::HOLEY_SMI_ELEMENTS),
+      arrayIsPushable: false
+    };
+  }
+  @ifnot(V8_ENABLE_UNDEFINED_DOUBLE) {
+    return FastJSArrayWitness{
+      stable: array,
+      unstable: array,
+      map: array.map,
+      hasDoubles: IsDoubleElementsKind(kind),
+      hasSmis:
+          IsElementsKindLessThanOrEqual(kind, ElementsKind::HOLEY_SMI_ELEMENTS),
+      arrayIsPushable: false
+    };
+  }
 }
 
 struct FastJSArrayForReadWitness {

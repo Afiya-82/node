@@ -13,6 +13,7 @@
 #include "include/libplatform/v8-tracing.h"
 #include "include/v8-platform.h"
 #include "src/base/compiler-specific.h"
+#include "src/base/logging.h"
 #include "src/base/platform/mutex.h"
 #include "src/libplatform/default-thread-isolated-allocator.h"
 
@@ -56,7 +57,7 @@ class V8_PLATFORM_EXPORT DefaultPlatform : public NON_EXPORTED_BASE(Platform) {
   // v8::Platform implementation.
   int NumberOfWorkerThreads() override;
   std::shared_ptr<TaskRunner> GetForegroundTaskRunner(
-      v8::Isolate* isolate) override;
+      v8::Isolate* isolate, TaskPriority priority) override;
   void PostTaskOnWorkerThreadImpl(TaskPriority priority,
                                   std::unique_ptr<Task> task,
                                   const SourceLocation& location) override;
@@ -64,14 +65,16 @@ class V8_PLATFORM_EXPORT DefaultPlatform : public NON_EXPORTED_BASE(Platform) {
       TaskPriority priority, std::unique_ptr<Task> task,
       double delay_in_seconds, const SourceLocation& location) override;
   bool IdleTasksEnabled(Isolate* isolate) override;
-  std::unique_ptr<JobHandle> CreateJob(
-      TaskPriority priority, std::unique_ptr<JobTask> job_state) override;
+  std::unique_ptr<JobHandle> CreateJobImpl(
+      TaskPriority priority, std::unique_ptr<JobTask> job_state,
+      const SourceLocation& location) override;
   double MonotonicallyIncreasingTime() override;
   double CurrentClockTimeMillis() override;
   v8::TracingController* GetTracingController() override;
   StackTracePrinter GetStackTracePrinter() override;
   v8::PageAllocator* GetPageAllocator() override;
   v8::ThreadIsolatedAllocator* GetThreadIsolatedAllocator() override;
+  size_t GetZeroSegmentSize() override;
 
   void NotifyIsolateShutdown(Isolate* isolate);
 
@@ -88,6 +91,7 @@ class V8_PLATFORM_EXPORT DefaultPlatform : public NON_EXPORTED_BASE(Platform) {
       case TaskPriority::kBestEffort:
         return base::Thread::Priority::kBestEffort;
     }
+    UNREACHABLE();
   }
 
   int priority_to_index(TaskPriority priority) const {

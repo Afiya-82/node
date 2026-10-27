@@ -9,6 +9,8 @@
 #include "src/codegen/assembler-inl.h"
 #include "src/codegen/flush-instruction-cache.h"
 #include "src/codegen/reloc-info-inl.h"
+#include "src/codegen/source-position-table.h"
+#include "src/codegen/source-position.h"
 #include "src/deoptimizer/deoptimizer.h"
 #include "src/objects/code-inl.h"
 
@@ -20,25 +22,35 @@
 namespace v8 {
 namespace internal {
 
-Tagged<ByteArray> Code::raw_position_table() const {
-  return TaggedField<ByteArray, kPositionTableOffset>::load(*this);
+Tagged<Object> Code::raw_deoptimization_data_or_interpreter_data() const {
+  return RawProtectedPointerField(kDeoptimizationDataOrInterpreterDataOffset)
+      .load();
 }
 
-Tagged<HeapObject> Code::raw_deoptimization_data_or_interpreter_data() const {
-  return TaggedField<HeapObject,
-                     kDeoptimizationDataOrInterpreterDataOffset>::load(*this);
+Tagged<Object> Code::raw_position_table() const {
+  return RawProtectedPointerField(kPositionTableOffset).load();
 }
 
-void Code::ClearEmbeddedObjects(Heap* heap) {
+void Code::ClearEmbeddedObjectsAndJSDispatchHandles(Heap* heap) {
   DisallowGarbageCollection no_gc;
   Tagged<HeapObject> undefined = ReadOnlyRoots(heap).undefined_value();
   Tagged<InstructionStream> istream = unchecked_instruction_stream();
   int mode_mask = RelocInfo::EmbeddedObjectModeMask();
+  mode_mask |= RelocInfo::JSDispatchHandleModeMask();
   {
-    CodePageMemoryModificationScope memory_modification_scope(istream);
-    for (RelocIterator it(*this, mode_mask); !it.done(); it.next()) {
-      DCHECK(RelocInfo::IsEmbeddedObjectMode(it.rinfo()->rmode()));
-      it.rinfo()->set_target_object(istream, undefined, SKIP_WRITE_BARRIER);
+    WritableJitAllocation jit_allocation = ThreadIsolation::LookupJitAllocation(
+        istream->address(), istream->Size(),
+        ThreadIsolation::JitAllocationType::kInstructionStream, true);
+    for (WritableRelocIterator it(jit_allocation, istream, constant_pool(),
+                                  mode_mask);
+         !it.done(); it.next()) {
+      const auto mode = it.rinfo()->rmode();
+      if (RelocInfo::IsEmbeddedObjectMode(mode)) {
+        it.rinfo()->set_target_object(istream, undefined, SKIP_WRITE_BARRIER);
+      } else {
+        it.rinfo()->set_js_dispatch_handle(istream, kNullJSDispatchHandle,
+                                           SKIP_WRITE_BARRIER);
+      }
     }
   }
   set_embedded_objects_cleared(true);
@@ -48,17 +60,39 @@ void Code::FlushICache() const {
   FlushInstructionCache(instruction_start(), instruction_size());
 }
 
-SafepointEntry Code::GetSafepointEntry(Isolate* isolate, Address pc) {
-  DCHECK(!is_maglevved());
-  SafepointTable table(isolate, pc, *this);
-  return table.FindEntry(pc);
+int Code::SourcePosition(int offset) const {
+  CHECK_NE(kind(), CodeKind::BASELINE);
+
+  // Subtract one because the current PC is one instruction after the call site.
+  offset--;
+
+  int position = 0;
+  if (!has_source_position_table()) return position;
+  for (SourcePositionTableIterator it(
+           source_position_table(),
+           SourcePositionTableIterator::kJavaScriptOnly,
+           SourcePositionTableIterator::kDontSkipFunctionEntry);
+       !it.done() && it.code_offset() <= offset; it.Advance()) {
+    position = it.source_position().ScriptOffset();
+  }
+  return position;
 }
 
-MaglevSafepointEntry Code::GetMaglevSafepointEntry(Isolate* isolate,
-                                                   Address pc) {
-  DCHECK(is_maglevved());
-  MaglevSafepointTable table(isolate, pc, *this);
-  return table.FindEntry(pc);
+int Code::SourceStatementPosition(int offset) const {
+  CHECK_NE(kind(), CodeKind::BASELINE);
+
+  // Subtract one because the current PC is one instruction after the call site.
+  offset--;
+
+  int position = 0;
+  if (!has_source_position_table()) return position;
+  for (SourcePositionTableIterator it(source_position_table());
+       !it.done() && it.code_offset() <= offset; it.Advance()) {
+    if (it.is_statement()) {
+      position = it.source_position().ScriptOffset();
+    }
+  }
+  return position;
 }
 
 bool Code::IsIsolateIndependent(Isolate* isolate) {
@@ -66,7 +100,10 @@ bool Code::IsIsolateIndependent(Isolate* isolate) {
       RelocInfo::AllRealModesMask() &
       ~RelocInfo::ModeMask(RelocInfo::CONST_POOL) &
       ~RelocInfo::ModeMask(RelocInfo::OFF_HEAP_TARGET) &
-      ~RelocInfo::ModeMask(RelocInfo::VENEER_POOL);
+      ~RelocInfo::ModeMask(RelocInfo::VENEER_POOL) &
+      ~RelocInfo::ModeMask(RelocInfo::WASM_CANONICAL_SIG_ID) &
+      ~RelocInfo::ModeMask(RelocInfo::WASM_CODE_POINTER_TABLE_ENTRY) &
+      ~RelocInfo::ModeMask(RelocInfo::WASM_CODE_POINTER);
   static_assert(kModeMask ==
                 (RelocInfo::ModeMask(RelocInfo::CODE_TARGET) |
                  RelocInfo::ModeMask(RelocInfo::RELATIVE_CODE_TARGET) |
@@ -74,36 +111,33 @@ bool Code::IsIsolateIndependent(Isolate* isolate) {
                  RelocInfo::ModeMask(RelocInfo::FULL_EMBEDDED_OBJECT) |
                  RelocInfo::ModeMask(RelocInfo::EXTERNAL_REFERENCE) |
                  RelocInfo::ModeMask(RelocInfo::INTERNAL_REFERENCE) |
-                 RelocInfo::ModeMask(RelocInfo::RELATIVE_SWITCH_TABLE_ENTRY) |
                  RelocInfo::ModeMask(RelocInfo::INTERNAL_REFERENCE_ENCODED) |
+                 RelocInfo::ModeMask(RelocInfo::JS_DISPATCH_HANDLE) |
                  RelocInfo::ModeMask(RelocInfo::NEAR_BUILTIN_ENTRY) |
                  RelocInfo::ModeMask(RelocInfo::WASM_CALL) |
                  RelocInfo::ModeMask(RelocInfo::WASM_STUB_CALL)));
 
-#if defined(V8_TARGET_ARCH_PPC) || defined(V8_TARGET_ARCH_PPC64) || \
-    defined(V8_TARGET_ARCH_MIPS64)
-  return RelocIterator(*this, kModeMask).done();
+#if defined(V8_TARGET_ARCH_PPC64) || defined(V8_TARGET_ARCH_MIPS64)
+  return RelocIterator(this, kModeMask).done();
 #elif defined(V8_TARGET_ARCH_X64) || defined(V8_TARGET_ARCH_ARM64) ||  \
-    defined(V8_TARGET_ARCH_ARM) || defined(V8_TARGET_ARCH_S390) ||     \
+    defined(V8_TARGET_ARCH_ARM) || defined(V8_TARGET_ARCH_S390X) ||    \
     defined(V8_TARGET_ARCH_IA32) || defined(V8_TARGET_ARCH_RISCV64) || \
     defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_RISCV32)
-  for (RelocIterator it(*this, kModeMask); !it.done(); it.next()) {
+  for (RelocIterator it(this, kModeMask); !it.done(); it.next()) {
     // On these platforms we emit relative builtin-to-builtin
     // jumps for isolate independent builtins in the snapshot. They are later
     // rewritten as pc-relative jumps to the off-heap instruction stream and are
     // thus process-independent. See also: FinalizeEmbeddedCodeTargets.
     if (RelocInfo::IsCodeTargetMode(it.rinfo()->rmode())) {
       Address target_address = it.rinfo()->target_address();
-      if (OffHeapInstructionStream::PcIsOffHeap(isolate, target_address))
+      if (OffHeapInstructionStream::PcIsOffHeap(isolate, target_address)) {
         continue;
+      }
 
       Tagged<Code> target = Code::FromTargetAddress(target_address);
       if (Builtins::IsIsolateIndependentBuiltin(target)) {
         continue;
       }
-    } else if (RelocInfo::IsRelativeSwitchTableEntry(it.rinfo()->rmode())) {
-      CHECK(is_builtin());
-      continue;
     }
     return false;
   }
@@ -117,16 +151,88 @@ bool Code::Inlines(Tagged<SharedFunctionInfo> sfi) {
   // We can only check for inlining for optimized code.
   DCHECK(is_optimized_code());
   DisallowGarbageCollection no_gc;
-  Tagged<DeoptimizationData> const data =
-      DeoptimizationData::cast(deoptimization_data());
-  if (data->length() == 0) return false;
-  if (data->SharedFunctionInfo() == sfi) return true;
+  Tagged<DeoptimizationData> const data = deoptimization_data();
+  if (data->ulength().value() == 0) return false;
+  if (data->GetSharedFunctionInfo() == sfi) return true;
   Tagged<DeoptimizationLiteralArray> const literals = data->LiteralArray();
   int const inlined_count = data->InlinedFunctionCount().value();
   for (int i = 0; i < inlined_count; ++i) {
-    if (SharedFunctionInfo::cast(literals->get(i)) == sfi) return true;
+    if (Cast<SharedFunctionInfo>(literals->get(i)) == sfi) return true;
   }
   return false;
+}
+
+void Code::SetMarkedForDeoptimization(Isolate* isolate,
+                                      LazyDeoptimizeReason reason) {
+  // We've already marked for deoptimization, return.
+  if (marked_for_deoptimization()) return;
+  set_marked_for_deoptimization(true);
+  // Eager deopts are already logged by the deoptimizer.
+  if (reason != LazyDeoptimizeReason::kEagerDeopt &&
+      V8_UNLIKELY(v8_flags.trace_deopt || v8_flags.log_deopt)) {
+    TraceMarkForDeoptimization(isolate, reason);
+  }
+  JSDispatchHandle handle = js_dispatch_handle();
+  if (handle != kNullJSDispatchHandle) {
+    JSDispatchTable& jdt = isolate->js_dispatch_table();
+    Tagged<Code> cur = jdt.GetCode(handle);
+    if (Tagged{this}.SafeEquals(cur)) {
+      if (v8_flags.reopt_after_lazy_deopts &&
+          isolate->concurrent_recompilation_enabled()) {
+        jdt.SetCodeNoWriteBarrier(
+            handle, *BUILTIN_CODE(isolate, InterpreterEntryTrampoline),
+            isolate);
+        // Somewhat arbitrary list of lazy deopt reasons which we expect to be
+        // stable enough to warrant either immediate re-optimization, or
+        // re-optimization after one invocation (to detect potential follow-up
+        // IC changes).
+        // TODO(olivf): We should also work on reducing the number of
+        // dependencies we create in the compilers to require less of these
+        // quick re-compilations.
+        switch (reason) {
+          case LazyDeoptimizeReason::kAllocationSiteTenuringChange:
+          case LazyDeoptimizeReason::kAllocationSiteTransitionChange:
+          case LazyDeoptimizeReason::kEmptyContextExtensionChange:
+          case LazyDeoptimizeReason::kFrameValueMaterialized:
+          case LazyDeoptimizeReason::kPropertyCellChange:
+          case LazyDeoptimizeReason::kContextCellChange:
+          case LazyDeoptimizeReason::kPrototypeChange:
+          case LazyDeoptimizeReason::kExceptionCaught:
+          case LazyDeoptimizeReason::kFieldTypeConstChange:
+          case LazyDeoptimizeReason::kFieldRepresentationChange:
+          case LazyDeoptimizeReason::kFieldTypeChange:
+          case LazyDeoptimizeReason::kInitialMapChange:
+          case LazyDeoptimizeReason::kMapDeprecated:
+            jdt.SetTieringRequest(
+                handle, TieringBuiltin::kMarkReoptimizeLazyDeoptimized,
+                isolate);
+            break;
+          default:
+            // TODO(olivf): This trampoline is just used to reset the budget. If
+            // we knew the feedback cell and the bytecode size here, we could
+            // directly reset the budget.
+            jdt.SetTieringRequest(handle, TieringBuiltin::kMarkLazyDeoptimized,
+                                  isolate);
+            break;
+        }
+      } else {
+        jdt.SetCodeNoWriteBarrier(handle, *BUILTIN_CODE(isolate, CompileLazy),
+                                  isolate);
+      }
+    }
+    // Ensure we don't try to patch the entry multiple times.
+    set_js_dispatch_handle(kNullJSDispatchHandle);
+  }
+  Tagged<ProtectedFixedArray> tmp = deoptimization_data();
+  // TODO(422951610): Zapping code discovered a bug in
+  // --maglev-inline-api-calls. Remove the flag check here once the bug is
+  // fixed.
+  if (tmp->ulength().value() > 0 && !v8_flags.maglev_inline_api_calls) {
+    Address start = instruction_start();
+    Address end = start + deoptimization_data()->DeoptExitStart().value();
+    RelocIterator it(instruction_stream(), RelocIterator::kAllModesMask);
+    Deoptimizer::ZapCode(start, end, it);
+  }
 }
 
 #ifdef ENABLE_DISASSEMBLER
@@ -164,9 +270,6 @@ void Disassemble(const char* name, std::ostream& os, Isolate* isolate,
   if ((name != nullptr) && (name[0] != '\0')) {
     os << "name = " << name << "\n";
   }
-  if (CodeKindIsOptimizedJSFunction(kind) && kind != CodeKind::BASELINE) {
-    os << "stack_slots = " << code->stack_slots() << "\n";
-  }
   os << "compiler = "
      << (code->is_turbofanned()       ? "turbofan"
          : code->is_maglevved()       ? "maglev"
@@ -195,7 +298,7 @@ void Disassemble(const char* name, std::ostream& os, Isolate* isolate,
   os << "\n";
 
   // TODO(cbruni): add support for baseline code.
-  if (kind != CodeKind::BASELINE) {
+  if (code->has_source_position_table()) {
     {
       SourcePositionTableIterator it(
           code->source_position_table(),
@@ -228,9 +331,8 @@ void Disassemble(const char* name, std::ostream& os, Isolate* isolate,
     }
   }
 
-  if (CodeKindCanDeoptimize(kind)) {
-    Tagged<DeoptimizationData> data =
-        DeoptimizationData::cast(code->deoptimization_data());
+  if (code->uses_deoptimization_data()) {
+    Tagged<DeoptimizationData> data = code->deoptimization_data();
     data->PrintDeoptimizationData(os);
   }
   os << "\n";
@@ -249,9 +351,7 @@ void Disassemble(const char* name, std::ostream& os, Isolate* isolate,
   if (code->has_handler_table()) {
     HandlerTable table(code);
     os << "Handler Table (size = " << table.NumberOfReturnEntries() << ")\n";
-    if (CodeKindIsOptimizedJSFunction(kind)) {
-      table.HandlerTableReturnPrint(os);
-    }
+    table.HandlerTableReturnPrint(os);
     os << "\n";
   }
 
@@ -277,21 +377,50 @@ void Disassemble(const char* name, std::ostream& os, Isolate* isolate,
 
 void Code::Disassemble(const char* name, std::ostream& os, Isolate* isolate,
                        Address current_pc) {
-  i::Disassemble(name, os, isolate, *this, current_pc);
+  i::Disassemble(name, os, isolate, this, current_pc);
 }
 
 void Code::DisassembleOnlyCode(const char* name, std::ostream& os,
                                Isolate* isolate, Address current_pc,
                                size_t range_limit) {
-  i::DisassembleOnlyCode(name, os, isolate, *this, current_pc, range_limit);
+  i::DisassembleOnlyCode(name, os, isolate, this, current_pc, range_limit);
 }
 
 #endif  // ENABLE_DISASSEMBLER
 
-void Code::SetMarkedForDeoptimization(Isolate* isolate, const char* reason) {
-  set_marked_for_deoptimization(true);
-  Deoptimizer::TraceMarkForDeoptimization(isolate, *this, reason);
+void Code::TraceMarkForDeoptimization(Isolate* isolate,
+                                      LazyDeoptimizeReason reason) {
+  Deoptimizer::TraceMarkForDeoptimization(isolate, this, reason);
 }
+
+#if V8_ENABLE_GEARBOX
+void Code::CopyFieldsWithGearboxForSerialization(Tagged<Code> dst,
+                                                 Tagged<Code> src,
+                                                 Isolate* isolate) {
+  Builtin src_id = src->builtin_id();
+  DCHECK(dst->is_gearbox_placeholder_builtin());
+  DCHECK(Builtins::IsISXVariant(src_id) || Builtins::IsGenericVariant(src_id) ||
+         src_id == Builtin::kIllegal);
+  dst->set_builtin_id(src_id);
+  dst->set_instruction_size(src->instruction_size());
+  dst->set_metadata_size(src->metadata_size());
+  dst->set_handler_table_offset(src->handler_table_offset());
+  dst->set_jump_table_info_offset(src->jump_table_info_offset());
+  dst->set_unwinding_info_offset(src->unwinding_info_offset());
+  dst->set_parameter_count(src->parameter_count());
+  dst->set_code_comments_offset(src->code_comments_offset());
+  dst->set_constant_pool_offset(src->constant_pool_offset());
+}
+
+void Code::CopyFieldsWithGearboxForDeserialization(Tagged<Code> dst,
+                                                   Tagged<Code> src,
+                                                   Isolate* isolate) {
+  CopyFieldsWithGearboxForSerialization(dst, src, isolate);
+  // We only set instruction_start field when we're doing deserialization,
+  // because in the serialization it was already be cleaned.
+  dst->SetInstructionStartForOffHeapBuiltin(isolate, src->instruction_start());
+}
+#endif  // V8_ENABLE_GEARBOX
 
 }  // namespace internal
 }  // namespace v8

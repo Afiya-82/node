@@ -5,20 +5,19 @@
 #ifndef V8_NUMBERS_CONVERSIONS_INL_H_
 #define V8_NUMBERS_CONVERSIONS_INL_H_
 
+#include "src/numbers/conversions.h"
+// Include the non-inl header before the rest of the headers.
+
 #include <float.h>   // Required for DBL_MAX and on Win32 for finite()
 #include <limits.h>  // Required for INT_MAX etc.
 #include <stdarg.h>
+
 #include <cmath>
-#include "src/common/globals.h"  // Required for V8_INFINITY
 
-// ----------------------------------------------------------------------------
-// Extra POSIX/ANSI functions for Win32/MSVC.
-
-#include "src/base/bits.h"
 #include "src/base/numbers/double.h"
-#include "src/base/platform/platform.h"
-#include "src/numbers/conversions.h"
+#include "src/common/globals.h"  // Required for V8_INFINITY
 #include "src/objects/heap-number-inl.h"
+#include "src/objects/heap-object-inl.h"
 #include "src/objects/smi-inl.h"
 
 namespace v8 {
@@ -57,6 +56,53 @@ inline unsigned int FastD2UI(double x) {
   return 0x80000000u;  // Return integer indefinite.
 }
 
+// Adopted from https://gist.github.com/rygorous/2156668
+inline uint16_t DoubleToFloat16(double value) {
+  uint64_t in = base::bit_cast<uint64_t>(value);
+  uint16_t out = 0;
+
+  // Take the absolute value of the input.
+  uint64_t sign = in & kFP64SignMask;
+  in ^= sign;
+
+  if (in >= kFP16InfinityAndNaNInfimum) {
+    // Result is infinity or NaN.
+    out = (in > kFP64Infinity) ? kFP16qNaN       // NaN->qNaN
+                               : kFP16Infinity;  // Inf->Inf
+  } else {
+    // Result is a (de)normalized number or zero.
+
+    if (in < kFP16DenormalThreshold) {
+      // Result is a denormal or zero. Use the magic value and FP addition to
+      // align 10 mantissa bits at the bottom of the float. Depends on FP
+      // addition being round-to-nearest-even.
+      double temp = base::bit_cast<double>(in) +
+                    base::bit_cast<double>(kFP64To16DenormalMagic);
+      out = base::bit_cast<uint64_t>(temp) - kFP64To16DenormalMagic;
+    } else {
+      // Result is not a denormal.
+
+      // Remember if the result mantissa will be odd before rounding.
+      uint64_t mant_odd = (in >> (kFP64MantissaBits - kFP16MantissaBits)) & 1;
+
+      // Update the exponent and round to nearest even.
+      //
+      // Rounding to nearest even is handled in two parts. First, adding
+      // kFP64To16RebiasExponentAndRound has the effect of rebiasing the
+      // exponent and that if any of the lower 41 bits of the mantissa are set,
+      // the 11th mantissa bit from the front becomes set. Second, adding
+      // mant_odd ensures ties are rounded to even.
+      in += kFP64To16RebiasExponentAndRound;
+      in += mant_odd;
+
+      out = in >> (kFP64MantissaBits - kFP16MantissaBits);
+    }
+  }
+
+  out |= sign >> 48;
+  return out;
+}
+
 inline float DoubleToFloat32(double x) {
   using limits = std::numeric_limits<float>;
   if (x > limits::max()) {
@@ -79,7 +125,7 @@ inline float DoubleToFloat32(double x) {
   return static_cast<float>(x);
 }
 
-// #sec-tointegerorinfinity
+// https://tc39.es/ecma262/#sec-tointegerorinfinity
 inline double DoubleToInteger(double x) {
   // ToIntegerOrInfinity normalizes -0 to +0. Special case 0 for performance.
   if (std::isnan(x) || x == 0.0) return 0;
@@ -88,7 +134,7 @@ inline double DoubleToInteger(double x) {
   return ((x > 0) ? std::floor(x) : std::ceil(x)) + 0.0;
 }
 
-// Implements most of https://tc39.github.io/ecma262/#sec-toint32.
+// Implements most of https://tc39.es/ecma262/#sec-toint32.
 int32_t DoubleToInt32(double x) {
   if ((std::isfinite(x)) && (x <= INT_MAX) && (x >= INT_MIN)) {
     // All doubles within these limits are trivially convertable to an int.
@@ -193,12 +239,12 @@ bool DoubleToUint32IfEqualToSelf(double value, uint32_t* uint32_value) {
 
 int32_t NumberToInt32(Tagged<Object> number) {
   if (IsSmi(number)) return Smi::ToInt(number);
-  return DoubleToInt32(HeapNumber::cast(number)->value());
+  return DoubleToInt32(Cast<HeapNumber>(number)->value());
 }
 
 uint32_t NumberToUint32(Tagged<Object> number) {
   if (IsSmi(number)) return Smi::ToInt(number);
-  return DoubleToUint32(HeapNumber::cast(number)->value());
+  return DoubleToUint32(Cast<HeapNumber>(number)->value());
 }
 
 uint32_t PositiveNumberToUint32(Tagged<Object> number) {
@@ -207,7 +253,7 @@ uint32_t PositiveNumberToUint32(Tagged<Object> number) {
     if (value <= 0) return 0;
     return value;
   }
-  double value = HeapNumber::cast(number)->value();
+  double value = Cast<HeapNumber>(number)->value();
   // Catch all values smaller than 1 and use the double-negation trick for NANs.
   if (!(value >= 1)) return 0;
   uint32_t max = std::numeric_limits<uint32_t>::max();
@@ -217,7 +263,7 @@ uint32_t PositiveNumberToUint32(Tagged<Object> number) {
 
 int64_t NumberToInt64(Tagged<Object> number) {
   if (IsSmi(number)) return Smi::ToInt(number);
-  double d = HeapNumber::cast(number)->value();
+  double d = Cast<HeapNumber>(number)->value();
   if (std::isnan(d)) return 0;
   if (d >= static_cast<double>(std::numeric_limits<int64_t>::max())) {
     return std::numeric_limits<int64_t>::max();
@@ -234,7 +280,7 @@ uint64_t PositiveNumberToUint64(Tagged<Object> number) {
     if (value <= 0) return 0;
     return value;
   }
-  double value = HeapNumber::cast(number)->value();
+  double value = Cast<HeapNumber>(number)->value();
   // Catch all values smaller than 1 and use the double-negation trick for NANs.
   if (!(value >= 1)) return 0;
   uint64_t max = std::numeric_limits<uint64_t>::max();
@@ -255,14 +301,20 @@ bool TryNumberToSize(Tagged<Object> number, size_t* result) {
     }
     return false;
   } else {
-    double value = HeapNumber::cast(number)->value();
+    double value = Cast<HeapNumber>(number)->value();
     // If value is compared directly to the limit, the limit will be
     // casted to a double and could end up as limit + 1,
     // because a double might not have enough mantissa bits for it.
     // So we might as well cast the limit first, and use < instead of <=.
     double maxSize = static_cast<double>(std::numeric_limits<size_t>::max());
     if (value >= 0 && value < maxSize) {
-      *result = static_cast<size_t>(value);
+      size_t size = static_cast<size_t>(value);
+#ifdef V8_ENABLE_SANDBOX
+      if (size > kMaxSafeBufferSizeForSandbox) {
+        return false;
+      }
+#endif
+      *result = size;
       return true;
     } else {
       return false;

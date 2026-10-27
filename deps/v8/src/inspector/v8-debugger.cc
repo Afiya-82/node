@@ -4,10 +4,13 @@
 
 #include "src/inspector/v8-debugger.h"
 
+#include <algorithm>
+
 #include "include/v8-container.h"
 #include "include/v8-context.h"
 #include "include/v8-function.h"
 #include "include/v8-microtask-queue.h"
+#include "include/v8-profiler.h"
 #include "include/v8-util.h"
 #include "src/inspector/inspected-context.h"
 #include "src/inspector/protocol/Protocol.h"
@@ -19,12 +22,15 @@
 #include "src/inspector/v8-runtime-agent-impl.h"
 #include "src/inspector/v8-stack-trace-impl.h"
 #include "src/inspector/v8-value-utils.h"
+#include "src/tracing/trace-event.h"
+#include "src/tracing/trace-id.h"
 
 namespace v8_inspector {
 
 namespace {
 
 static const size_t kMaxAsyncTaskStacks = 8 * 1024;
+static const size_t kMaxExternalParents = 1 * 1024;
 static const int kNoBreakpointId = 0;
 
 template <typename Map>
@@ -38,7 +44,7 @@ void cleanupExpiredWeakPointers(Map& map) {
   }
 }
 
-class MatchPrototypePredicate : public v8::debug::QueryObjectPredicate {
+class MatchPrototypePredicate : public v8::QueryObjectPredicate {
  public:
   MatchPrototypePredicate(V8InspectorImpl* inspector,
                           v8::Local<v8::Context> context,
@@ -122,8 +128,9 @@ void V8Debugger::disable() {
               hasAgentAcceptsPause = true;
             }
           });
-      if (!hasAgentAcceptsPause)
+      if (!hasAgentAcceptsPause) {
         m_inspector->client()->quitMessageLoopOnPause();
+      }
     }
   }
   if (--m_enableCount) return;
@@ -162,8 +169,8 @@ std::vector<std::unique_ptr<V8DebuggerScript>> V8Debugger::getCompiledScripts(
       if (!script->ContextId().To(&contextId)) continue;
       if (m_inspector->contextGroupId(contextId) != contextGroupId) continue;
     }
-    result.push_back(V8DebuggerScript::Create(m_isolate, script, false, agent,
-                                              m_inspector->client()));
+    result.push_back(std::make_unique<V8DebuggerScript>(
+        m_isolate, script, false, agent, m_inspector->client()));
   }
   return result;
 }
@@ -480,10 +487,12 @@ void V8Debugger::handleProgramBreak(
          (m_taskWithScheduledBreakPauseRequested ||
           m_externalAsyncTaskPauseRequested || m_pauseOnNextCallRequested));
   if (m_taskWithScheduledBreakPauseRequested ||
-      m_externalAsyncTaskPauseRequested)
+      m_externalAsyncTaskPauseRequested) {
     breakReasons.Add(v8::debug::BreakReason::kAsyncStep);
-  if (m_pauseOnNextCallRequested)
+  }
+  if (m_pauseOnNextCallRequested) {
     breakReasons.Add(v8::debug::BreakReason::kAgent);
+  }
 
   m_targetContextGroupId = 0;
   m_pauseOnNextCallRequested = false;
@@ -492,16 +501,16 @@ void V8Debugger::handleProgramBreak(
   m_externalAsyncTaskPauseRequested = false;
   m_taskWithScheduledBreakPauseRequested = false;
 
-  bool scheduledOOMBreak = m_scheduledOOMBreak;
-  DCHECK(scheduledOOMBreak ==
-         breakReasons.contains(v8::debug::BreakReason::kOOM));
+  bool isOOMBreak = breakReasons.contains(v8::debug::BreakReason::kOOM);
+  DCHECK(!isOOMBreak || m_scheduledOOMBreak);
   bool hasAgents = false;
 
   m_inspector->forEachSession(
       contextGroupId,
-      [&scheduledOOMBreak, &hasAgents](V8InspectorSessionImpl* session) {
-        if (session->debuggerAgent()->acceptsPause(scheduledOOMBreak))
+      [isOOMBreak, &hasAgents](V8InspectorSessionImpl* session) {
+        if (session->debuggerAgent()->acceptsPause(isOOMBreak)) {
           hasAgents = true;
+        }
       });
   if (!hasAgents) return;
 
@@ -518,14 +527,15 @@ void V8Debugger::handleProgramBreak(
   m_inspector->forEachSession(
       contextGroupId,
       [&pausedContext, &exception, &breakpointIds, &exceptionType, &isUncaught,
-       &scheduledOOMBreak, &breakReasons](V8InspectorSessionImpl* session) {
-        if (session->debuggerAgent()->acceptsPause(scheduledOOMBreak)) {
+       isOOMBreak, &breakReasons](V8InspectorSessionImpl* session) {
+        if (session->debuggerAgent()->acceptsPause(isOOMBreak)) {
           session->debuggerAgent()->didPause(
               InspectedContext::contextId(pausedContext), exception,
               breakpointIds, exceptionType, isUncaught, breakReasons);
         }
       });
   {
+    v8::Isolate::AllowJavascriptExecutionScope allow_script(m_isolate);
     v8::Context::Scope scope(pausedContext);
 
     m_inspector->forEachSession(
@@ -546,8 +556,10 @@ void V8Debugger::handleProgramBreak(
                                 }
                               });
 
-  if (m_scheduledOOMBreak) m_isolate->RestoreOriginalHeapLimit();
-  m_scheduledOOMBreak = false;
+  if (isOOMBreak) {
+    if (m_scheduledOOMBreak) m_isolate->RestoreOriginalHeapLimit();
+    m_scheduledOOMBreak = false;
+  }
 }
 
 namespace {
@@ -563,6 +575,11 @@ size_t HeapLimitForDebugging(size_t initial_heap_limit) {
 size_t V8Debugger::nearHeapLimitCallback(void* data, size_t current_heap_limit,
                                          size_t initial_heap_limit) {
   V8Debugger* thisPtr = static_cast<V8Debugger*>(data);
+  if (thisPtr->m_scheduledOOMBreak) {
+    // nearHeapLimitCallback can arrive multiple times before the interrupt
+    // fires.
+    return HeapLimitForDebugging(initial_heap_limit);
+  }
   thisPtr->m_originalHeapLimit = current_heap_limit;
   thisPtr->m_scheduledOOMBreak = true;
   v8::Local<v8::Context> context =
@@ -583,7 +600,7 @@ size_t V8Debugger::nearHeapLimitCallback(void* data, size_t current_heap_limit,
 }
 
 void V8Debugger::ScriptCompiled(v8::Local<v8::debug::Script> script,
-                                bool is_live_edited, bool has_compile_error) {
+                                bool has_compile_error) {
   if (m_ignoreScriptParsedEventsCounter != 0) return;
 
   int contextId;
@@ -594,14 +611,12 @@ void V8Debugger::ScriptCompiled(v8::Local<v8::debug::Script> script,
 
   m_inspector->forEachSession(
       m_inspector->contextGroupId(contextId),
-      [isolate, &script, has_compile_error, is_live_edited,
+      [isolate, &script, has_compile_error,
        client](V8InspectorSessionImpl* session) {
         auto agent = session->debuggerAgent();
         if (!agent->enabled()) return;
-        agent->didParseSource(
-            V8DebuggerScript::Create(isolate, script, is_live_edited, agent,
-                                     client),
-            !has_compile_error);
+        agent->didParseSource(std::make_unique<V8DebuggerScript>(
+            isolate, script, has_compile_error, agent, client));
       });
 }
 
@@ -615,8 +630,9 @@ V8Debugger::ActionAfterInstrumentation V8Debugger::BreakOnInstrumentation(
   bool hasAgents = false;
   m_inspector->forEachSession(
       contextGroupId, [&hasAgents](V8InspectorSessionImpl* session) {
-        if (session->debuggerAgent()->acceptsPause(false /* isOOMBreak */))
+        if (session->debuggerAgent()->acceptsPause(false /* isOOMBreak */)) {
           hasAgents = true;
+        }
       });
   if (!hasAgents) return ActionAfterInstrumentation::kPauseIfBreakpointsHit;
 
@@ -643,10 +659,12 @@ V8Debugger::ActionAfterInstrumentation V8Debugger::BreakOnInstrumentation(
   hasAgents = false;
   m_inspector->forEachSession(
       contextGroupId, [&hasAgents](V8InspectorSessionImpl* session) {
-        if (session->debuggerAgent()->enabled())
+        if (session->debuggerAgent()->enabled()) {
           session->debuggerAgent()->didContinue();
-        if (session->debuggerAgent()->acceptsPause(false /* isOOMBreak */))
+        }
+        if (session->debuggerAgent()->acceptsPause(false /* isOOMBreak */)) {
           hasAgents = true;
+        }
       });
   if (!hasAgents) {
     return ActionAfterInstrumentation::kContinue;
@@ -741,21 +759,26 @@ void V8Debugger::BreakpointConditionEvaluated(
 }
 
 void V8Debugger::AsyncEventOccurred(v8::debug::DebugAsyncActionType type,
-                                    int id, bool isBlackboxed) {
+                                    int id, bool isBlackboxed,
+                                    int skipFrameCount) {
+  const int kDontSkipFrames = 0;
   // Async task events from Promises are given misaligned pointers to prevent
   // from overlapping with other Blink task identifiers.
   void* task = reinterpret_cast<void*>(id * 2 + 1);
   switch (type) {
     case v8::debug::kDebugPromiseThen:
-      asyncTaskScheduledForStack(toStringView("Promise.then"), task, false);
+      asyncTaskScheduledForStack(toStringView("Promise.then"), task, false,
+                                 kDontSkipFrames);
       if (!isBlackboxed) asyncTaskCandidateForStepping(task);
       break;
     case v8::debug::kDebugPromiseCatch:
-      asyncTaskScheduledForStack(toStringView("Promise.catch"), task, false);
+      asyncTaskScheduledForStack(toStringView("Promise.catch"), task, false,
+                                 kDontSkipFrames);
       if (!isBlackboxed) asyncTaskCandidateForStepping(task);
       break;
     case v8::debug::kDebugPromiseFinally:
-      asyncTaskScheduledForStack(toStringView("Promise.finally"), task, false);
+      asyncTaskScheduledForStack(toStringView("Promise.finally"), task, false,
+                                 kDontSkipFrames);
       if (!isBlackboxed) asyncTaskCandidateForStepping(task);
       break;
     case v8::debug::kDebugWillHandle:
@@ -766,10 +789,13 @@ void V8Debugger::AsyncEventOccurred(v8::debug::DebugAsyncActionType type,
       asyncTaskFinishedForStack(task);
       asyncTaskFinishedForStepping(task);
       break;
-    case v8::debug::kDebugAwait: {
-      asyncTaskScheduledForStack(toStringView("await"), task, false, true);
+    case v8::debug::kDebugAwait:
+      asyncTaskScheduledForStack(toStringView("await"), task, false,
+                                 skipFrameCount);
       break;
-    }
+    case v8::debug::kDebugStackTraceCaptured:
+      asyncStackTraceCaptured(id);
+      break;
   }
 }
 
@@ -786,6 +812,7 @@ v8::MaybeLocal<v8::Value> V8Debugger::getTargetScopes(
     v8::Local<v8::Context> context, v8::Local<v8::Value> value,
     ScopeTargetKind kind) {
   std::unique_ptr<v8::debug::ScopeIterator> iterator;
+  v8::Local<v8::Function> generator_function;
   switch (kind) {
     case FUNCTION:
       iterator = v8::debug::ScopeIterator::CreateForFunction(
@@ -796,6 +823,7 @@ v8::MaybeLocal<v8::Value> V8Debugger::getTargetScopes(
           v8::debug::GeneratorObject::Cast(value);
       if (!generatorObject->IsSuspended()) return v8::MaybeLocal<v8::Value>();
 
+      generator_function = generatorObject->Function();
       iterator = v8::debug::ScopeIterator::CreateForGeneratorObject(
           m_isolate, value.As<v8::Object>());
       break;
@@ -806,10 +834,29 @@ v8::MaybeLocal<v8::Value> V8Debugger::getTargetScopes(
     return v8::MaybeLocal<v8::Value>();
   }
 
-  for (; !iterator->Done(); iterator->Advance()) {
+  // [[Scopes]] reflects the runtime context chain: For generators, list the
+  // generator's own scopes up to its function scope, then continue with the
+  // closure's context chain like for functions (instead of the lexical outer
+  // scopes). Empty scopes are omitted, except for a generator's own scope.
+  auto advance = [&]() {
+    if (!generator_function.IsEmpty() &&
+        iterator->GetType() == v8::debug::ScopeIterator::ScopeTypeLocal) {
+      iterator = v8::debug::ScopeIterator::CreateForFunction(
+          m_isolate, generator_function);
+      generator_function.Clear();
+    } else {
+      iterator->Advance();
+    }
+  };
+  for (; iterator && !iterator->Done(); advance()) {
+    if (iterator->GetType() != v8::debug::ScopeIterator::ScopeTypeLocal &&
+        !iterator->DeclaresLocals()) {
+      continue;
+    }
     v8::Local<v8::Object> scope = v8::Object::New(m_isolate);
-    if (!addInternalObject(context, scope, V8InternalValueType::kScope))
+    if (!addInternalObject(context, scope, V8InternalValueType::kScope)) {
       return v8::MaybeLocal<v8::Value>();
+    }
     String16 nameSuffix = toProtocolStringWithTypeCheck(
         m_isolate, iterator->GetFunctionDebugName());
     String16 description;
@@ -854,8 +901,9 @@ v8::MaybeLocal<v8::Value> V8Debugger::getTargetScopes(
                        toV8StringInternalized(m_isolate, "object"), object);
     createDataProperty(context, result, result->Length(), scope);
   }
-  if (!addInternalObject(context, result, V8InternalValueType::kScopeList))
+  if (!addInternalObject(context, result, V8InternalValueType::kScopeList)) {
     return v8::MaybeLocal<v8::Value>();
+  }
   return result;
 }
 
@@ -871,7 +919,7 @@ v8::MaybeLocal<v8::Value> V8Debugger::generatorScopes(
 
 v8::MaybeLocal<v8::Array> V8Debugger::collectionsEntries(
     v8::Local<v8::Context> context, v8::Local<v8::Value> collection) {
-  v8::Isolate* isolate = context->GetIsolate();
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
   v8::Local<v8::Array> entries;
   bool isKeyValue = false;
   if (!collection->IsObject() || !collection.As<v8::Object>()
@@ -883,16 +931,18 @@ v8::MaybeLocal<v8::Array> V8Debugger::collectionsEntries(
   v8::Local<v8::Array> wrappedEntries = v8::Array::New(isolate);
   CHECK(!isKeyValue || wrappedEntries->Length() % 2 == 0);
   if (!wrappedEntries->SetPrototype(context, v8::Null(isolate))
-           .FromMaybe(false))
+           .FromMaybe(false)) {
     return v8::MaybeLocal<v8::Array>();
+  }
   for (uint32_t i = 0; i < entries->Length(); i += isKeyValue ? 2 : 1) {
     v8::Local<v8::Value> item;
     if (!entries->Get(context, i).ToLocal(&item)) continue;
     v8::Local<v8::Value> value;
     if (isKeyValue && !entries->Get(context, i + 1).ToLocal(&value)) continue;
     v8::Local<v8::Object> wrapper = v8::Object::New(isolate);
-    if (!wrapper->SetPrototype(context, v8::Null(isolate)).FromMaybe(false))
+    if (!wrapper->SetPrototype(context, v8::Null(isolate)).FromMaybe(false)) {
       continue;
+    }
     createDataProperty(
         context, wrapper,
         toV8StringInternalized(isolate, isKeyValue ? "key" : "value"), item);
@@ -900,8 +950,9 @@ v8::MaybeLocal<v8::Array> V8Debugger::collectionsEntries(
       createDataProperty(context, wrapper,
                          toV8StringInternalized(isolate, "value"), value);
     }
-    if (!addInternalObject(context, wrapper, V8InternalValueType::kEntry))
+    if (!addInternalObject(context, wrapper, V8InternalValueType::kEntry)) {
       continue;
+    }
     createDataProperty(context, wrappedEntries, wrappedEntries->Length(),
                        wrapper);
   }
@@ -913,48 +964,54 @@ v8::MaybeLocal<v8::Array> V8Debugger::privateMethods(
   if (!receiver->IsObject()) {
     return v8::MaybeLocal<v8::Array>();
   }
-  v8::Isolate* isolate = context->GetIsolate();
-  std::vector<v8::Local<v8::Value>> names;
-  std::vector<v8::Local<v8::Value>> values;
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  v8::LocalVector<v8::Value> names(isolate);
+  v8::LocalVector<v8::Value> values(isolate);
   int filter =
       static_cast<int>(v8::debug::PrivateMemberFilter::kPrivateMethods);
   if (!v8::debug::GetPrivateMembers(context, receiver.As<v8::Object>(), filter,
                                     &names, &values) ||
-      names.size() == 0) {
+      names.empty()) {
     return v8::MaybeLocal<v8::Array>();
   }
 
   v8::Local<v8::Array> result = v8::Array::New(isolate);
-  if (!result->SetPrototype(context, v8::Null(isolate)).FromMaybe(false))
+  if (!result->SetPrototype(context, v8::Null(isolate)).FromMaybe(false)) {
     return v8::MaybeLocal<v8::Array>();
+  }
   for (uint32_t i = 0; i < names.size(); i++) {
     v8::Local<v8::Value> name = names[i];
     v8::Local<v8::Value> value = values[i];
     DCHECK(value->IsFunction());
     v8::Local<v8::Object> wrapper = v8::Object::New(isolate);
-    if (!wrapper->SetPrototype(context, v8::Null(isolate)).FromMaybe(false))
+    if (!wrapper->SetPrototype(context, v8::Null(isolate)).FromMaybe(false)) {
       continue;
+    }
     createDataProperty(context, wrapper,
                        toV8StringInternalized(isolate, "name"), name);
     createDataProperty(context, wrapper,
                        toV8StringInternalized(isolate, "value"), value);
     if (!addInternalObject(context, wrapper,
-                           V8InternalValueType::kPrivateMethod))
+                           V8InternalValueType::kPrivateMethod)) {
       continue;
+    }
     createDataProperty(context, result, result->Length(), wrapper);
   }
 
   if (!addInternalObject(context, result,
-                         V8InternalValueType::kPrivateMethodList))
+                         V8InternalValueType::kPrivateMethodList)) {
     return v8::MaybeLocal<v8::Array>();
+  }
   return result;
 }
 
 v8::MaybeLocal<v8::Array> V8Debugger::internalProperties(
     v8::Local<v8::Context> context, v8::Local<v8::Value> value) {
   v8::Local<v8::Array> properties;
-  if (!v8::debug::GetInternalProperties(m_isolate, value).ToLocal(&properties))
+  if (!v8::debug::GetInternalProperties(m_isolate, value)
+           .ToLocal(&properties)) {
     return v8::MaybeLocal<v8::Array>();
+  }
   v8::Local<v8::Array> entries;
   if (collectionsEntries(context, value).ToLocal(&entries)) {
     createDataProperty(context, properties, properties->Length(),
@@ -991,10 +1048,10 @@ v8::MaybeLocal<v8::Array> V8Debugger::internalProperties(
 
 v8::Local<v8::Array> V8Debugger::queryObjects(v8::Local<v8::Context> context,
                                               v8::Local<v8::Object> prototype) {
-  v8::Isolate* isolate = context->GetIsolate();
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
   std::vector<v8::Global<v8::Object>> v8_objects;
   MatchPrototypePredicate predicate(m_inspector, context, prototype);
-  v8::debug::QueryObjects(context, &predicate, &v8_objects);
+  isolate->GetHeapProfiler()->QueryObjects(context, &predicate, &v8_objects);
 
   v8::MicrotasksScope microtasksScope(context,
                                       v8::MicrotasksScope::kDoNotRunMicrotasks);
@@ -1014,15 +1071,17 @@ std::unique_ptr<V8StackTraceImpl> V8Debugger::createStackTrace(
 }
 
 void V8Debugger::setAsyncCallStackDepth(V8DebuggerAgentImpl* agent, int depth) {
-  if (depth <= 0)
+  if (depth <= 0) {
     m_maxAsyncCallStackDepthMap.erase(agent);
-  else
+  } else {
     m_maxAsyncCallStackDepthMap[agent] = depth;
+  }
 
   int maxAsyncCallStackDepth = 0;
   for (const auto& pair : m_maxAsyncCallStackDepthMap) {
-    if (pair.second > maxAsyncCallStackDepth)
+    if (pair.second > maxAsyncCallStackDepth) {
       maxAsyncCallStackDepth = pair.second;
+    }
   }
 
   if (m_maxAsyncCallStackDepth == maxAsyncCallStackDepth) return;
@@ -1065,12 +1124,34 @@ void V8Debugger::setMaxCallStackSizeToCapture(V8RuntimeAgentImpl* agent,
   } else {
     m_maxCallStackSizeToCapture = 0;
     for (auto const& pair : m_maxCallStackSizeToCaptureMap) {
-      if (m_maxCallStackSizeToCapture < pair.second)
+      if (m_maxCallStackSizeToCapture < pair.second) {
         m_maxCallStackSizeToCapture = pair.second;
+      }
     }
     m_isolate->SetCaptureStackTraceForUncaughtExceptions(
         m_maxCallStackSizeToCapture > 0, m_maxCallStackSizeToCapture);
   }
+}
+
+void V8Debugger::asyncParentFor(int stackTraceId,
+                                std::shared_ptr<AsyncStackTrace>* asyncParent,
+                                V8StackTraceId* externalParent) const {
+  auto it = m_asyncParents.find(stackTraceId);
+  if (it != m_asyncParents.end()) {
+    *asyncParent = it->second.lock();
+    if (*asyncParent && (*asyncParent)->isEmpty()) {
+      *asyncParent = (*asyncParent)->parent().lock();
+    }
+  } else {
+    auto externalIt = std::find_if(
+        m_externalParents.begin(), m_externalParents.end(),
+        [stackTraceId](const auto& p) { return p.first == stackTraceId; });
+    if (externalIt != m_externalParents.end()) {
+      *externalParent = externalIt->second;
+    }
+  }
+  DCHECK_IMPLIES(!externalParent->IsInvalid(), !*asyncParent);
+  DCHECK_IMPLIES(*asyncParent, externalParent->IsInvalid());
 }
 
 std::shared_ptr<AsyncStackTrace> V8Debugger::stackTraceFor(
@@ -1089,8 +1170,9 @@ V8StackTraceId V8Debugger::storeCurrentStackTrace(
   int contextGroupId = currentContextGroupId();
   if (!contextGroupId) return V8StackTraceId();
 
+  const int kDontSkipFrames = 0;
   std::shared_ptr<AsyncStackTrace> asyncStack =
-      AsyncStackTrace::capture(this, toString16(description));
+      AsyncStackTrace::capture(this, toString16(description), kDontSkipFrames);
   if (!asyncStack) return V8StackTraceId();
 
   uintptr_t id = AsyncStackTrace::store(this, asyncStack);
@@ -1143,7 +1225,8 @@ void V8Debugger::externalAsyncTaskFinished(const V8StackTraceId& parent) {
 
 void V8Debugger::asyncTaskScheduled(const StringView& taskName, void* task,
                                     bool recurring) {
-  asyncTaskScheduledForStack(taskName, task, recurring);
+  const int kDontSkipFrames = 0;
+  asyncTaskScheduledForStack(taskName, task, recurring, kDontSkipFrames);
   asyncTaskCandidateForStepping(task);
 }
 
@@ -1162,13 +1245,34 @@ void V8Debugger::asyncTaskFinished(void* task) {
   asyncTaskFinishedForStack(task);
 }
 
+#ifdef V8_USE_PERFETTO
+namespace {
+void AddTraceDataWithSample(v8::Isolate* isolate,
+                            perfetto::TracedValue context) {
+  uint64_t trace_id = v8::tracing::TraceId();
+  auto dict = std::move(context).WriteDictionary();
+  v8::CpuProfiler::CpuProfiler::CollectSample(isolate, trace_id);
+  dict.Add("sampleTraceId", trace_id);
+}
+}  // namespace
+#endif  // V8_USE_PERFETTO
+
 void V8Debugger::asyncTaskScheduledForStack(const StringView& taskName,
                                             void* task, bool recurring,
-                                            bool skipTopFrame) {
+                                            int skipFrameCount) {
+#ifdef V8_USE_PERFETTO
+  TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.inspector"),
+              "v8::Debugger::AsyncTaskScheduled", "taskName",
+              toString16(taskName).utf8().c_str(),
+              perfetto::Flow::ProcessScoped(reinterpret_cast<uintptr_t>(task)),
+              "data", [isolate = m_isolate](perfetto::TracedValue context) {
+                AddTraceDataWithSample(isolate, std::move(context));
+              });
+#endif  // V8_USE_PERFETTO
   if (!m_maxAsyncCallStackDepth) return;
   v8::HandleScope scope(m_isolate);
   std::shared_ptr<AsyncStackTrace> asyncStack =
-      AsyncStackTrace::capture(this, toString16(taskName), skipTopFrame);
+      AsyncStackTrace::capture(this, toString16(taskName), skipFrameCount);
   if (asyncStack) {
     m_asyncTaskStacks[task] = asyncStack;
     if (recurring) m_recurringTasks.insert(task);
@@ -1178,12 +1282,29 @@ void V8Debugger::asyncTaskScheduledForStack(const StringView& taskName,
 }
 
 void V8Debugger::asyncTaskCanceledForStack(void* task) {
+#ifdef V8_USE_PERFETTO
+  TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.inspector"),
+              "v8::Debugger::AsyncTaskCanceled",
+              perfetto::Flow::ProcessScoped(reinterpret_cast<uintptr_t>(task)),
+              "data", [isolate = m_isolate](perfetto::TracedValue context) {
+                AddTraceDataWithSample(isolate, std::move(context));
+              });
+#endif  // V8_USE_PERFETTO
   if (!m_maxAsyncCallStackDepth) return;
   m_asyncTaskStacks.erase(task);
   m_recurringTasks.erase(task);
 }
 
 void V8Debugger::asyncTaskStartedForStack(void* task) {
+#ifdef V8_USE_PERFETTO
+  TRACE_EVENT_BEGIN(
+      TRACE_DISABLED_BY_DEFAULT("v8.inspector"), "v8::Debugger::AsyncTaskRun",
+      perfetto::Flow::ProcessScoped(reinterpret_cast<uintptr_t>(task)), "data",
+      [isolate = m_isolate](perfetto::TracedValue context) {
+        AddTraceDataWithSample(isolate, std::move(context));
+      });
+#endif  // V8_USE_PERFETTO
+
   if (!m_maxAsyncCallStackDepth) return;
   // Needs to support following order of events:
   // - asyncTaskScheduled
@@ -1204,9 +1325,12 @@ void V8Debugger::asyncTaskStartedForStack(void* task) {
 }
 
 void V8Debugger::asyncTaskFinishedForStack(void* task) {
+#ifdef V8_USE_PERFETTO
+  TRACE_EVENT_END(TRACE_DISABLED_BY_DEFAULT("v8.inspector"));
+#endif  // V8_USE_PERFETTO
   if (!m_maxAsyncCallStackDepth) return;
   // We could start instrumenting half way and the stack is empty.
-  if (!m_currentTasks.size()) return;
+  if (m_currentTasks.empty()) return;
   DCHECK(m_currentTasks.back() == task);
   m_currentTasks.pop_back();
 
@@ -1250,12 +1374,25 @@ void V8Debugger::asyncTaskCanceledForStepping(void* task) {
   asyncTaskFinishedForStepping(task);
 }
 
+void V8Debugger::asyncStackTraceCaptured(int id) {
+  auto async_stack = currentAsyncParent();
+  if (async_stack) {
+    m_asyncParents.emplace(id, async_stack);
+  }
+  auto externalParent = currentExternalParent();
+  if (!externalParent.IsInvalid()) {
+    m_externalParents.push_back(std::make_pair(id, externalParent));
+  }
+}
+
 void V8Debugger::allAsyncTasksCanceled() {
   m_asyncTaskStacks.clear();
   m_recurringTasks.clear();
   m_currentAsyncParent.clear();
   m_currentExternalParent.clear();
   m_currentTasks.clear();
+  m_currentAsyncParent.clear();
+  m_externalParents.clear();
 
   m_allAsyncStacks.clear();
 }
@@ -1280,8 +1417,9 @@ std::unique_ptr<V8StackTraceImpl> V8Debugger::captureStackTrace(
   } else {
     m_inspector->forEachSession(
         contextGroupId, [this, &stackSize](V8InspectorSessionImpl* session) {
-          if (session->runtimeAgent()->enabled())
+          if (session->runtimeAgent()->enabled()) {
             stackSize = maxCallStackSizeToCapture();
+          }
         });
   }
   return V8StackTraceImpl::capture(this, stackSize);
@@ -1302,12 +1440,19 @@ void V8Debugger::collectOldAsyncStacksIfNeeded() {
   }
   cleanupExpiredWeakPointers(m_asyncTaskStacks);
   cleanupExpiredWeakPointers(m_cachedStackFrames);
+  cleanupExpiredWeakPointers(m_asyncParents);
   cleanupExpiredWeakPointers(m_storedStackTraces);
   for (auto it = m_recurringTasks.begin(); it != m_recurringTasks.end();) {
     if (m_asyncTaskStacks.find(*it) == m_asyncTaskStacks.end()) {
       it = m_recurringTasks.erase(it);
     } else {
       ++it;
+    }
+  }
+  if (m_externalParents.size() > kMaxExternalParents) {
+    size_t halfOfExternalParents = (m_externalParents.size() + 1) / 2;
+    while (m_externalParents.size() > halfOfExternalParents) {
+      m_externalParents.pop_front();
     }
   }
 }
@@ -1321,8 +1466,8 @@ std::shared_ptr<StackFrame> V8Debugger::symbolize(
   CachedStackFrameKey key{scriptId, lineNumber, columnNumber};
   auto functionName = toProtocolString(isolate(), v8Frame->GetFunctionName());
   auto it = m_cachedStackFrames.find(key);
-  if (it != m_cachedStackFrames.end() && !it->second.expired()) {
-    auto stackFrame = it->second.lock();
+  std::shared_ptr<StackFrame> stackFrame;
+  if (it != m_cachedStackFrames.end() && (stackFrame = it->second.lock())) {
     if (stackFrame->functionName() == functionName) {
       DCHECK_EQ(
           stackFrame->sourceURL(),
@@ -1334,9 +1479,9 @@ std::shared_ptr<StackFrame> V8Debugger::symbolize(
       toProtocolString(isolate(), v8Frame->GetScriptNameOrSourceURL());
   auto hasSourceURLComment =
       v8Frame->GetScriptName() != v8Frame->GetScriptNameOrSourceURL();
-  auto stackFrame = std::make_shared<StackFrame>(
-      std::move(functionName), scriptId, std::move(sourceURL), lineNumber,
-      columnNumber, hasSourceURLComment);
+  stackFrame = std::make_shared<StackFrame>(std::move(functionName), scriptId,
+                                            std::move(sourceURL), lineNumber,
+                                            columnNumber, hasSourceURLComment);
   m_cachedStackFrames.emplace(key, stackFrame);
   return stackFrame;
 }
@@ -1361,7 +1506,8 @@ bool V8Debugger::addInternalObject(v8::Local<v8::Context> context,
                                    v8::Local<v8::Object> object,
                                    V8InternalValueType type) {
   int contextId = InspectedContext::contextId(context);
-  InspectedContext* inspectedContext = m_inspector->getContext(contextId);
+  std::shared_ptr<InspectedContext> inspectedContext =
+      m_inspector->getContext(contextId);
   return inspectedContext ? inspectedContext->addInternalObject(object, type)
                           : false;
 }

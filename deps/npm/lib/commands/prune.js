@@ -1,7 +1,8 @@
-// prune extraneous packages
 const reifyFinish = require('../utils/reify-finish.js')
-
+const resolveAllowScripts = require('../utils/resolve-allow-scripts.js')
+const { patchRelaxOpts } = require('../utils/cli-only-flag.js')
 const ArboristWorkspaceCmd = require('../arborist-cmd.js')
+
 class Prune extends ArboristWorkspaceCmd {
   static description = 'Remove extraneous packages'
   static name = 'prune'
@@ -20,14 +21,18 @@ class Prune extends ArboristWorkspaceCmd {
   async exec () {
     const where = this.npm.prefix
     const Arborist = require('@npmcli/arborist')
+    const { policy: allowScriptsPolicy } = await resolveAllowScripts(this.npm)
     const opts = {
       ...this.npm.flatOptions,
       path: where,
       workspaces: this.workspaceNames,
+      allowScripts: allowScriptsPolicy,
+      ...patchRelaxOpts(this.npm.config),
     }
     const arb = new Arborist(opts)
     await arb.prune(opts)
     await reifyFinish(this.npm, arb)
   }
 }
+
 module.exports = Prune

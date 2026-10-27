@@ -16,7 +16,7 @@ function WasmAtomicNotify(memory, offset, index, num) {
       kExprLocalGet, 0,
       kExprLocalGet, 1,
       kAtomicPrefix,
-      kExprAtomicNotify, /* alignment */ 0, offset])
+      kExprAtomicNotify, /* alignment */ 2, offset])
     .exportAs("main");
 
   // Instantiate module, get function exports
@@ -36,7 +36,7 @@ function WasmI32AtomicWait(memory, offset, index, val, timeout) {
       kExprLocalGet, 2,
       kExprI64SConvertF64,
       kAtomicPrefix,
-      kExprI32AtomicWait, /* alignment */ 0, offset])
+      kExprI32AtomicWait, /* alignment */ 2, offset])
       .exportAs("main");
 
   // Instantiate module, get function exports
@@ -68,7 +68,7 @@ function WasmI64AtomicWait(memory, offset, index, val_low,
       kExprLocalGet, 3,
       kExprI64SConvertF64,
       kAtomicPrefix,
-      kExprI64AtomicWait, /* alignment */ 0, offset])
+      kExprI64AtomicWait, /* alignment */ 3, offset])
       .exportAs("main");
 
   // Instantiate module, get function exports
@@ -181,8 +181,8 @@ function WasmI64AtomicWait(memory, offset, index, val_low,
 
   assertEquals(kAtomicWaitTimedOut, WasmI32AtomicWait(memory, 0, 0, 0, 0));
 
-  let i32a = new Int32Array(memory.buffer);
-  i32a[0] = 1;
+  let view = new DataView(memory.buffer);
+  view.setInt32(0, 1, true);
   assertEquals(kAtomicWaitNotEqual, WasmI32AtomicWait(memory, 0, 0, 0, -1));
   assertEquals(kAtomicWaitTimedOut, WasmI32AtomicWait(memory, 0, 0, 1, 0));
 })();
@@ -194,9 +194,9 @@ function WasmI64AtomicWait(memory, offset, index, val_low,
 
   assertEquals(kAtomicWaitTimedOut, WasmI64AtomicWait(memory, 0, 0, 0, 0, 0));
 
-  let i32a = new Int32Array(memory.buffer);
-  i32a[0] = 1;
-  i32a[1] = 2;
+  let view = new DataView(memory.buffer);
+  view.setInt32(0, 1, true);
+  view.setInt32(4, 2, true);
   assertEquals(kAtomicWaitNotEqual, WasmI64AtomicWait(memory, 0, 0, 0, 0, -1));
   assertEquals(kAtomicWaitTimedOut, WasmI64AtomicWait(memory, 0, 0, 1, 2, 0));
 })();
@@ -224,7 +224,7 @@ if (this.Worker) {
   let i32a = new Int32Array(memory.buffer);
   const numWorkers = 4;
 
-  let workerScript = `onmessage = function(msg) {
+  let workerScript = `onmessage = function({data:msg}) {
     d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
     ${WasmI32AtomicWait.toString()}
     ${WasmI64AtomicWait.toString()}

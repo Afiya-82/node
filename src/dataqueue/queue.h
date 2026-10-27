@@ -141,6 +141,19 @@ class DataQueue : public MemoryRetainer {
     using Done = bob::Done;
   };
 
+  // A BackpressureListener can be used to receive notifications
+  // when a non-idempotent DataQueue releases entries as they
+  // are consumed.
+  class BackpressureListener {
+   public:
+    virtual void EntryRead(size_t amount) = 0;
+
+    // Called before the reader pulls from the DataQueue. Gives
+    // the listener a chance to flush pending data into the queue
+    // before the pull checks the entries list.
+    virtual void BeforePull() {}
+  };
+
   // A DataQueue::Entry represents a logical chunk of data in the queue.
   // The entry may or may not represent memory-resident data. It may
   // or may not be consumable more than once.
@@ -213,8 +226,11 @@ class DataQueue : public MemoryRetainer {
   static std::unique_ptr<Entry> CreateDataQueueEntry(
       std::shared_ptr<DataQueue> data_queue);
 
+  // Returns nullptr if the file cannot be stat'd. When `status` is given, it
+  // is set to the libuv error code so callers can report why.
   static std::unique_ptr<Entry> CreateFdEntry(Environment* env,
-                                              v8::Local<v8::Value> path);
+                                              v8::Local<v8::Value> path,
+                                              int* status = nullptr);
 
   // Creates a Reader for the given queue. If the queue is idempotent,
   // any number of readers can be created, all of which are guaranteed
@@ -284,6 +300,10 @@ class DataQueue : public MemoryRetainer {
   // If the size of the queue cannot be known, or the cap has not
   // been set, maybeCapRemaining() will return std::nullopt.
   virtual std::optional<uint64_t> maybeCapRemaining() const = 0;
+
+  // BackpressureListeners only work on non-idempotent DataQueues.
+  virtual void addBackpressureListener(BackpressureListener* listener) = 0;
+  virtual void removeBackpressureListener(BackpressureListener* listener) = 0;
 
   static void Initialize(Environment* env, v8::Local<v8::Object> target);
   static void RegisterExternalReferences(ExternalReferenceRegistry* registry);

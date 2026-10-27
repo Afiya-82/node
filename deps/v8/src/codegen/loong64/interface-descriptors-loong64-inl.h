@@ -85,6 +85,21 @@ constexpr Register KeyedLoadWithVectorDescriptor::VectorRegister() {
 }
 
 // static
+constexpr Register EnumeratedKeyedLoadBaselineDescriptor::EnumIndexRegister() {
+  return a4;
+}
+
+// static
+constexpr Register EnumeratedKeyedLoadBaselineDescriptor::CacheTypeRegister() {
+  return a5;
+}
+
+// static
+constexpr Register EnumeratedKeyedLoadBaselineDescriptor::SlotRegister() {
+  return a2;
+}
+
+// static
 constexpr Register KeyedHasICBaselineDescriptor::ReceiverRegister() {
   return kInterpreterAccumulatorRegister;
 }
@@ -123,9 +138,11 @@ constexpr Register DefineKeyedOwnDescriptor::FlagsRegister() { return a5; }
 constexpr Register StoreTransitionDescriptor::MapRegister() { return a5; }
 
 // static
-constexpr Register ApiGetterDescriptor::HolderRegister() { return a0; }
+constexpr Register CallApiGetterDescriptor::NameRegister() {
+  return kCArgRegs[0];
+}
 // static
-constexpr Register ApiGetterDescriptor::CallbackRegister() { return a3; }
+constexpr Register CallApiGetterDescriptor::CallbackRegister() { return a3; }
 
 // static
 constexpr Register GrowArrayElementsDescriptor::ObjectRegister() { return a0; }
@@ -142,6 +159,22 @@ constexpr Register BaselineLeaveFrameDescriptor::WeightRegister() { return a3; }
 
 // static
 constexpr Register TypeConversionDescriptor::ArgumentRegister() { return a0; }
+
+// static
+constexpr Register
+MaglevOptimizeCodeOrTailCallOptimizedCodeSlotDescriptor::FlagsRegister() {
+  return t1;
+}
+// static
+constexpr Register MaglevOptimizeCodeOrTailCallOptimizedCodeSlotDescriptor::
+    FeedbackVectorRegister() {
+  return t2;
+}
+// static
+constexpr Register
+MaglevOptimizeCodeOrTailCallOptimizedCodeSlotDescriptor::TemporaryRegister() {
+  return a5;
+}
 
 // static
 constexpr auto TypeofDescriptor::registers() { return RegisterArray(a0); }
@@ -191,6 +224,14 @@ constexpr auto CallFunctionTemplateDescriptor::registers() {
   // a1 : function template info
   // a0 : number of arguments (on the stack)
   return RegisterArray(a1, a0);
+}
+
+// static
+constexpr auto CallFunctionTemplateGenericDescriptor::registers() {
+  // a1 : function template info
+  // a2 : number of arguments (on the stack)
+  // a3 : topmost script-having context
+  return RegisterArray(a1, a2, a3);
 }
 
 // static
@@ -266,6 +307,42 @@ constexpr auto Compare_BaselineDescriptor::registers() {
   return RegisterArray(a1, a0, a2);
 }
 
+#ifdef V8_ENABLE_SPARKPLUG_PLUS
+// static
+constexpr auto CompareAndTryPatchCodeDescriptor::registers() {
+  // a1: left operand
+  // a0: right operand
+  // a2: current feedback value
+  // a3: feedback offset
+  return RegisterArray(a1, a0, a2, a3);
+}
+
+// static
+constexpr auto BinaryOpAndTryPatchCodeDescriptor::registers() {
+  // a1: left operand
+  // a0: right operand
+  // a2: current feedback value
+  // a3: feedback offset
+  return RegisterArray(a1, a0, a2, a3);
+}
+
+// static
+constexpr auto UnaryOpAndTryPatchCodeDescriptor::registers() {
+  // a0: value
+  // a2: current feedback value
+  // a3: feedback offset
+  return RegisterArray(a0, a2, a3);
+}
+#endif  // V8_ENABLE_SPARKPLUG_PLUS
+
+// static
+constexpr auto Compare_WithEmbeddedFeedbackOffsetDescriptor::registers() {
+  // a1: left operand
+  // a0: right operand
+  // a2: feedback offset
+  return RegisterArray(a1, a0, a2);
+}
+
 // static
 constexpr auto BinaryOpDescriptor::registers() { return RegisterArray(a1, a0); }
 
@@ -278,11 +355,11 @@ constexpr auto BinaryOp_BaselineDescriptor::registers() {
 }
 
 // static
-constexpr auto BinarySmiOp_BaselineDescriptor::registers() {
-  // a0: left operand
-  // a1: right operand
-  // a2: feedback slot
-  return RegisterArray(a0, a1, a2);
+constexpr auto BinaryOp_WithEmbeddedFeedbackOffsetDescriptor::registers() {
+  // a1: left operand
+  // a0: right operand
+  // a2: feedback offset
+  return RegisterArray(a1, a0, a2);
 }
 
 // static
@@ -296,12 +373,14 @@ CallApiCallbackOptimizedDescriptor::ActualArgumentsCountRegister() {
   return a2;
 }
 // static
-constexpr Register CallApiCallbackOptimizedDescriptor::CallDataRegister() {
-  return a3;
+constexpr Register
+CallApiCallbackGenericDescriptor::TopmostScriptHavingContextRegister() {
+  return a1;
 }
 // static
-constexpr Register CallApiCallbackOptimizedDescriptor::HolderRegister() {
-  return a0;
+constexpr Register
+CallApiCallbackOptimizedDescriptor::FunctionTemplateInfoRegister() {
+  return a3;
 }
 
 // static
@@ -310,12 +389,9 @@ CallApiCallbackGenericDescriptor::ActualArgumentsCountRegister() {
   return a2;
 }
 // static
-constexpr Register CallApiCallbackGenericDescriptor::CallHandlerInfoRegister() {
+constexpr Register
+CallApiCallbackGenericDescriptor::FunctionTemplateInfoRegister() {
   return a3;
-}
-// static
-constexpr Register CallApiCallbackGenericDescriptor::HolderRegister() {
-  return a0;
 }
 
 // static
@@ -341,6 +417,12 @@ constexpr auto InterpreterPushArgsThenConstructDescriptor::registers() {
   // a3 : new target
   // a2 : allocation site feedback if available, undefined otherwise
   return RegisterArray(a0, a4, a1, a3, a2);
+}
+
+// static
+constexpr auto ConstructForwardAllArgsDescriptor::registers() {
+  return RegisterArray(a1,   // constructor to call
+                       a3);  // new target
 }
 
 // static

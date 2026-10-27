@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --experimental-wasm-gc --no-liftoff
-
 d8.file.execute('test/mjsunit/wasm/wasm-module-builder.js');
 
 let builder = new WasmModuleBuilder();
@@ -35,7 +33,7 @@ builder.addType(makeSig([kWasmF32], [kWasmAnyRef]));
 // 6
 builder.addType(makeSig([], []));
 // 7
-builder.addArray(kWasmAnyRef, true);
+builder.addArray(kWasmAnyRef);
 // 8
 builder.addStruct([
   makeField(kWasmF32, true),
@@ -50,7 +48,7 @@ builder.addStruct([
   makeField(wasmRefNullType(2), false)
 ]);
 // 10
-builder.addArray(kWasmF64, false);
+builder.addArray(kWasmF64, {mutable: false});
 // 11
 builder.addType(makeSig([], [wasmRefNullType(11)]), 2, false);
 // 12
@@ -94,9 +92,9 @@ builder.addStruct([
 // 19
 builder.addStruct([makeField(wasmRefType(0), true)]);
 // 20
-builder.addArray(kWasmI32, true);
+builder.addArray(kWasmI32);
 // 21
-builder.addArray(kWasmI64, false);
+builder.addArray(kWasmI64, {mutable: false});
 builder.endRecGroup();
 
 builder.addDeclarativeElementSegment([1, 2]);
@@ -106,10 +104,10 @@ builder.addFunction("test", kSig_v_v)
   .addBody([
     kExprLoop, 0x7d,  // loop @4 f32
       kExprRefFunc, 0x01,  // ref.func
-      kExprRefNull, 0x65,  // ref.null
+      kExprRefNull, kNullRefCode,  // ref.null
       kExprRefAsNonNull,  // ref.as_non_null
       kExprI64Const, 0x81, 0x80, 0x7e,  // i64.const
-      kExprRefNull, 0x65,  // ref.null
+      kExprRefNull, kNullRefCode,  // ref.null
       kExprRefAsNonNull,  // ref.as_non_null
       kGCPrefix, kExprStructNew, 0x0d,  // struct.new
       kGCPrefix, kExprStructGet, 0x0d, 0x03,  // struct.get
@@ -120,7 +118,7 @@ builder.addFunction("test", kSig_v_v)
       kExprF32Const, 0x00, 0x00, 0x00, 0x00,  // f32.const
       kExprEnd,  // end @39
     kExprI32SConvertF32,  // i32.trunc_f32_s
-    kExprRefNull, 0x65,  // ref.null
+    kExprRefNull, kNullRefCode,  // ref.null
     kExprRefFunc, 0x02,  // ref.func
     kGCPrefix, kExprStructNew, 0x01,  // struct.new
     kExprDrop,  // drop

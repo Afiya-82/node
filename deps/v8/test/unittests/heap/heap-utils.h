@@ -14,8 +14,13 @@
 namespace v8 {
 namespace internal {
 
+class NormalPage;
+void ForceEvacuationCandidate(NormalPage* page);
+class SemiSpaceNewSpace;
+
 class HeapInternalsBase {
  protected:
+  size_t OldGenerationSpaceAvailable(Heap* heap);
   void SimulateIncrementalMarking(Heap* heap, bool force_completion);
   void SimulateFullSpace(
       v8::internal::NewSpace* space,
@@ -23,6 +28,14 @@ class HeapInternalsBase {
   void SimulateFullSpace(v8::internal::PagedSpace* space);
   void FillCurrentPage(v8::internal::NewSpace* space,
                        std::vector<Handle<FixedArray>>* out_handles = nullptr);
+  void FillCurrentPageButNBytes(
+      v8::internal::SemiSpaceNewSpace* space, int extra_bytes,
+      std::vector<Handle<FixedArray>>* out_handles = nullptr);
+  AllocationResult AllocateByteArrayForTest(Heap* heap, uint32_t length,
+                                            AllocationType allocation_type);
+  AllocationResult AllocateFixedArrayForTest(Heap* heap, uint32_t length,
+                                             AllocationType allocation);
+  void SetForceOOM(Heap* heap, bool value);
 };
 
 inline void InvokeMajorGC(i::Isolate* isolate) {
@@ -44,7 +57,8 @@ inline void InvokeAtomicMajorGC(i::Isolate* isolate) {
                                  GarbageCollectionReason::kTesting);
   if (heap->sweeping_in_progress()) {
     heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kUnifiedHeap);
+        Heap::SweepingForcedFinalizationMode::kUnifiedHeap,
+        CompleteSweepingReason::kTesting);
   }
 }
 
@@ -53,7 +67,8 @@ inline void InvokeAtomicMinorGC(i::Isolate* isolate) {
   Heap* heap = isolate->heap();
   if (heap->sweeping_in_progress()) {
     heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kUnifiedHeap);
+        Heap::SweepingForcedFinalizationMode::kUnifiedHeap,
+        CompleteSweepingReason::kTesting);
   }
 }
 
@@ -92,6 +107,10 @@ class WithHeapInternals : public TMixin, HeapInternalsBase {
 
   Heap* heap() const { return this->i_isolate()->heap(); }
 
+  size_t OldGenerationSpaceAvailable() {
+    return HeapInternalsBase::OldGenerationSpaceAvailable(heap());
+  }
+
   void SimulateIncrementalMarking(bool force_completion = true) {
     return HeapInternalsBase::SimulateIncrementalMarking(heap(),
                                                          force_completion);
@@ -106,13 +125,31 @@ class WithHeapInternals : public TMixin, HeapInternalsBase {
     return HeapInternalsBase::SimulateFullSpace(space);
   }
 
-  void GrowNewSpace() {
+  void FillCurrentPageButNBytes(
+      v8::internal::SemiSpaceNewSpace* space, int extra_bytes,
+      std::vector<Handle<FixedArray>>* out_handles = nullptr) {
+    return HeapInternalsBase::FillCurrentPageButNBytes(space, extra_bytes,
+                                                       out_handles);
+  }
+
+  AllocationResult AllocateByteArrayForTest(Heap* heap, uint32_t length,
+                                            AllocationType allocation_type) {
+    return HeapInternalsBase::AllocateByteArrayForTest(heap, length,
+                                                       allocation_type);
+  }
+  AllocationResult AllocateFixedArrayForTest(Heap* heap, uint32_t length,
+                                             AllocationType allocation) {
+    return HeapInternalsBase::AllocateFixedArrayForTest(heap, length,
+                                                        allocation);
+  }
+  void SetForceOOM(Heap* heap, bool value) {
+    HeapInternalsBase::SetForceOOM(heap, value);
+  }
+
+  void GrowNewSpaceToMaximumCapacity() {
     IsolateSafepointScope scope(heap());
     NewSpace* new_space = heap()->new_space();
-    if (new_space->TotalCapacity() < new_space->MaximumCapacity()) {
-      new_space->Grow();
-    }
-    CHECK(new_space->EnsureCurrentCapacity());
+    new_space->GrowToMaximumCapacityForTesting();
   }
 
   void SealCurrentObjects() {
@@ -123,23 +160,48 @@ class WithHeapInternals : public TMixin, HeapInternalsBase {
     InvokeMajorGC();
     InvokeMajorGC();
     heap()->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
-    heap()->old_space()->FreeLinearAllocationArea();
-    for (Page* page : *heap()->old_space()) {
+        Heap::SweepingForcedFinalizationMode::kV8Only,
+        CompleteSweepingReason::kTesting);
+    heap()->FreeMainThreadLinearAllocationAreas();
+    for (NormalPage* page : *heap()->old_space()) {
       page->MarkNeverAllocateForTesting();
     }
   }
 
+  void ForceEvacuationCandidate(NormalPage* page) {
+    i::ForceEvacuationCandidate(page);
+  }
+
   void EmptyNewSpaceUsingGC() { InvokeMajorGC(); }
+
+  int NumberOfGlobalObjects() {
+    int count = 0;
+    HeapObjectIterator iterator(heap());
+    for (Tagged<HeapObject> obj = iterator.Next(); !obj.is_null();
+         obj = iterator.Next()) {
+      if (IsJSGlobalObject(obj)) count++;
+    }
+    return count;
+  }
 };
 
-using TestWithHeapInternals =                  //
-    WithHeapInternals<                         //
-        WithInternalIsolateMixin<              //
-            WithIsolateScopeMixin<             //
-                WithIsolateMixin<              //
-                    WithDefaultPlatformMixin<  //
-                        ::testing::Test>>>>>;
+template <typename TMixin>
+class WithCppHeap : public TMixin {
+ public:
+  WithCppHeap() {
+    IsolateWrapper::set_cpp_heap_for_next_isolate(
+        v8::CppHeap::Create(V8::GetCurrentPlatform(), CppHeapCreateParams{{}}));
+  }
+};
+
+using TestWithHeapInternals =                      //
+    WithHeapInternals<                             //
+        WithInternalIsolateMixin<                  //
+            WithIsolateScopeMixin<                 //
+                WithIsolateMixin<                  //
+                    WithCppHeap<                   //
+                        WithDefaultPlatformMixin<  //
+                            ::testing::Test>>>>>>;
 
 using TestWithHeapInternalsAndContext =  //
     WithContextMixin<                    //
@@ -150,7 +212,7 @@ bool InYoungGeneration(v8::Isolate* isolate, const GlobalOrPersistent& global) {
   CHECK(!v8_flags.single_generation);
   v8::HandleScope scope(isolate);
   auto tmp = global.Get(isolate);
-  return Heap::InYoungGeneration(*v8::Utils::OpenHandle(*tmp));
+  return HeapLayout::InYoungGeneration(*v8::Utils::OpenDirectHandle(*tmp));
 }
 
 bool IsNewObjectInCorrectGeneration(Tagged<HeapObject> object);
@@ -160,7 +222,7 @@ bool IsNewObjectInCorrectGeneration(v8::Isolate* isolate,
                                     const GlobalOrPersistent& global) {
   v8::HandleScope scope(isolate);
   auto tmp = global.Get(isolate);
-  return IsNewObjectInCorrectGeneration(*v8::Utils::OpenHandle(*tmp));
+  return IsNewObjectInCorrectGeneration(*v8::Utils::OpenDirectHandle(*tmp));
 }
 
 // ManualGCScope allows for disabling GC heuristics. This is useful for tests
@@ -183,6 +245,46 @@ class V8_NODISCARD ManualGCScope final {
   const bool flag_detect_ineffective_gcs_near_heap_limit_;
   const bool flag_cppheap_concurrent_marking_;
 };
+
+class V8_NODISCARD ManualEvacuationCandidatesSelectionScope final {
+ public:
+  explicit ManualEvacuationCandidatesSelectionScope(ManualGCScope&) {
+    DCHECK(!v8_flags.manual_evacuation_candidates_selection);
+    v8_flags.manual_evacuation_candidates_selection = true;
+  }
+  ~ManualEvacuationCandidatesSelectionScope() {
+    DCHECK(v8_flags.manual_evacuation_candidates_selection);
+    v8_flags.manual_evacuation_candidates_selection = false;
+  }
+};
+
+// DisableHandleChecksForMockingScope disables the checks for v8::Local and
+// internal::DirectHandle, so that such handles can be allocated off-stack.
+// This is required for mocking functions that take such handles as parameters
+// and/or return them as results. For correctness (with direct handles), when
+// this scope is used, it is important to ensure that the objects stored in
+// handles used for mocking are retained by other means, so that they will not
+// be reclaimed by a garbage collection.
+// Note: The check is only performed in debug builds with enabled slow DCHECKs.
+#ifdef ENABLE_SLOW_DCHECKS
+class V8_NODISCARD DisableHandleChecksForMockingScope final
+    : public StackAllocatedCheck::Scope {
+ public:
+  DisableHandleChecksForMockingScope() : StackAllocatedCheck::Scope(false) {}
+};
+#else
+class V8_NODISCARD DisableHandleChecksForMockingScope final {
+ public:
+  DisableHandleChecksForMockingScope() {}
+};
+#endif
+
+void AbandonCurrentlyFreeMemory(PagedSpace* space);
+
+Tagged<HeapObject> AllocateAligned(Heap* heap, MainAllocator* allocator,
+                                   int size, AllocationAlignment alignment);
+
+Address AlignOldSpace(Heap* heap, AllocationAlignment alignment, int offset);
 
 }  // namespace internal
 }  // namespace v8

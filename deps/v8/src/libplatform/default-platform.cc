@@ -18,6 +18,10 @@
 #include "src/libplatform/default-job.h"
 #include "src/libplatform/default-worker-threads-task-runner.h"
 
+#if defined(V8_ENABLE_PARTITION_ALLOC)
+#include "third_party/partition_alloc/src/partition_alloc/partition_address_space.h"
+#endif
+
 namespace v8 {
 namespace platform {
 
@@ -198,7 +202,7 @@ void DefaultPlatform::RunIdleTasks(v8::Isolate* isolate,
 }
 
 std::shared_ptr<TaskRunner> DefaultPlatform::GetForegroundTaskRunner(
-    v8::Isolate* isolate) {
+    v8::Isolate* isolate, TaskPriority priority) {
   base::MutexGuard guard(&lock_);
   if (foreground_task_runner_map_.find(isolate) ==
       foreground_task_runner_map_.end()) {
@@ -215,10 +219,10 @@ void DefaultPlatform::PostTaskOnWorkerThreadImpl(
     TaskPriority priority, std::unique_ptr<Task> task,
     const SourceLocation& location) {
   // If this DCHECK fires, then this means that either
-  // - V8 is running without the --single-threaded flag but
-  //   but the platform was created as a single-threaded platform.
-  // - or some component in V8 is ignoring --single-threaded
-  //   and posting a background task.
+  // - V8 is running without the --single-threaded flag but the platform was
+  //   created as a single-threaded platform or
+  // - some component in V8 is ignoring --single-threaded and posting a
+  //   background task.
   int index = priority_to_index(priority);
   DCHECK_NOT_NULL(worker_threads_task_runners_[index]);
   worker_threads_task_runners_[index]->PostTask(std::move(task));
@@ -242,8 +246,9 @@ bool DefaultPlatform::IdleTasksEnabled(Isolate* isolate) {
   return idle_task_support_ == IdleTaskSupport::kEnabled;
 }
 
-std::unique_ptr<JobHandle> DefaultPlatform::CreateJob(
-    TaskPriority priority, std::unique_ptr<JobTask> job_task) {
+std::unique_ptr<JobHandle> DefaultPlatform::CreateJobImpl(
+    TaskPriority priority, std::unique_ptr<JobTask> job_task,
+    const SourceLocation& location) {
   size_t num_worker_threads = NumberOfWorkerThreads();
   if (priority == TaskPriority::kBestEffort && num_worker_threads > 2) {
     num_worker_threads = 2;
@@ -286,6 +291,14 @@ v8::ThreadIsolatedAllocator* DefaultPlatform::GetThreadIsolatedAllocator() {
     return &thread_isolated_allocator_;
   }
   return nullptr;
+}
+
+size_t DefaultPlatform::GetZeroSegmentSize() {
+#if defined(V8_ENABLE_PARTITION_ALLOC)
+  return partition_alloc::internal::PartitionAddressSpace::GetZeroSegmentSize();
+#else
+  return 0;
+#endif
 }
 
 void DefaultPlatform::NotifyIsolateShutdown(Isolate* isolate) {

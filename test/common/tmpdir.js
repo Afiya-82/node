@@ -5,30 +5,53 @@ const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { isMainThread } = require('worker_threads');
+const isUnixLike = process.platform !== 'win32';
+let escapePOSIXShell;
 
 function rmSync(pathname, useSpawn) {
   if (useSpawn) {
-    const escapedPath = pathname.replaceAll('\\', '\\\\');
-    spawnSync(
-      process.execPath,
-      [
-        '-e',
-        `require("fs").rmSync("${escapedPath}", { maxRetries: 3, recursive: true, force: true });`,
-      ],
-    );
+    if (isUnixLike) {
+      escapePOSIXShell ??= require('./index.js').escapePOSIXShell;
+      for (let i = 0; i < 3; i++) {
+        const { status } = spawnSync(...escapePOSIXShell`rm -rf "${pathname}"`);
+        if (status === 0) {
+          break;
+        }
+      }
+    } else {
+      spawnSync(
+        process.execPath,
+        [
+          '-e',
+          `fs.rmSync(${JSON.stringify(pathname)}, { maxRetries: 3, recursive: true, force: true });`,
+        ],
+      );
+    }
   } else {
     fs.rmSync(pathname, { maxRetries: 3, recursive: true, force: true });
   }
 }
 
+// Under the permission model, fs.realpathSync() requires read access to the
+// path, which tests running with a restricted --allow-fs-read may not grant
+// for NODE_TEST_DIR.
+function resolveTestRoot(dir) {
+  try {
+    return fs.realpathSync(dir);
+  } catch (err) {
+    if (err.code !== 'ERR_ACCESS_DENIED') throw err;
+    return path.resolve(dir);
+  }
+}
+
 const testRoot = process.env.NODE_TEST_DIR ?
-  fs.realpathSync(process.env.NODE_TEST_DIR) : path.resolve(__dirname, '..');
+  resolveTestRoot(process.env.NODE_TEST_DIR) : path.resolve(__dirname, '..');
 
 // Using a `.` prefixed name, which is the convention for "hidden" on POSIX,
 // gets tools to ignore it by default or by simple rules, especially eslint.
 const tmpdirName = '.tmp.' +
   (process.env.TEST_SERIAL_ID || process.env.TEST_THREAD_ID || '0');
-const tmpPath = path.join(testRoot, tmpdirName);
+let tmpPath = path.join(testRoot, tmpdirName);
 
 let firstRefresh = true;
 function refresh(useSpawn = false) {
@@ -89,7 +112,13 @@ function fileURL(...paths) {
 module.exports = {
   fileURL,
   hasEnoughSpace,
-  path: tmpPath,
   refresh,
   resolve,
+
+  get path() {
+    return tmpPath;
+  },
+  set path(newPath) {
+    tmpPath = path.resolve(newPath);
+  },
 };

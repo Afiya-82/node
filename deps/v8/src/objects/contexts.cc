@@ -4,95 +4,186 @@
 
 #include "src/objects/contexts.h"
 
+#include <bit>
+#include <limits>
+#include <optional>
+
+#include "include/v8-internal.h"
 #include "src/ast/modules.h"
+#include "src/common/globals.h"
 #include "src/debug/debug.h"
 #include "src/execution/isolate-inl.h"
+#include "src/flags/flags.h"
+#include "src/handles/handles.h"
 #include "src/init/bootstrapper.h"
+#include "src/numbers/conversions-inl.h"
+#include "src/objects/dependent-code.h"
+#include "src/objects/heap-number.h"
 #include "src/objects/module-inl.h"
+#include "src/objects/objects-inl.h"
 #include "src/objects/string-set-inl.h"
+#include "src/utils/boxed-float.h"
 
-namespace v8 {
-namespace internal {
+namespace v8::internal {
 
-void ScriptContextTable::AddLocalNamesFromContext(
-    Isolate* isolate, Handle<ScriptContextTable> script_context_table,
-    Handle<Context> script_context, bool ignore_duplicates,
+// static
+Handle<ScriptContextTable> ScriptContextTable::New(Isolate* isolate,
+                                                   uint32_t capacity,
+                                                   AllocationType allocation) {
+  DCHECK_LE(capacity, kMaxCapacity);
+
+  auto names = NameToIndexHashTable::New(isolate, 16);
+
+  std::optional<DisallowGarbageCollection> no_gc;
+  Handle<ScriptContextTable> result =
+      Allocate(isolate, capacity, &no_gc, allocation);
+  result->set_length(0, kReleaseStore);
+  result->set_names_to_context_index(*names);
+  ReadOnlyRoots roots{isolate};
+  MemsetTagged(result->RawFieldOfFirstElement(), roots.undefined_value(),
+               capacity);
+  return result;
+}
+
+namespace {
+
+// Adds local names from `script_context` to the hash table.
+Handle<NameToIndexHashTable> AddLocalNamesFromContext(
+    Isolate* isolate, Handle<NameToIndexHashTable> names_table,
+    DirectHandle<Context> script_context, bool ignore_duplicates,
     int script_context_index) {
   ReadOnlyRoots roots(isolate);
-  PtrComprCageBase cage_base(isolate);
-  Handle<NameToIndexHashTable> names_table(
-      script_context_table->names_to_context_index(cage_base), isolate);
-  Handle<ScopeInfo> scope_info(script_context->scope_info(cage_base), isolate);
+  DirectHandle<ScopeInfo> scope_info(script_context->scope_info(), isolate);
   int local_count = scope_info->ContextLocalCount();
   names_table = names_table->EnsureCapacity(isolate, names_table, local_count);
+
   for (auto it : ScopeInfo::IterateLocalNames(scope_info)) {
-    Handle<Name> name(it->name(cage_base), isolate);
+    DirectHandle<Name> name(it->name(), isolate);
     if (ignore_duplicates) {
-      int32_t hash = NameToIndexShape::Hash(roots, name);
-      if (names_table->FindEntry(cage_base, roots, name, hash).is_found()) {
+      int32_t hash = NameToIndexShape::Hash(roots, *name);
+      if (names_table->FindEntry(roots, *name, hash).is_found()) {
         continue;
       }
     }
     names_table = NameToIndexHashTable::Add(isolate, names_table, name,
                                             script_context_index);
   }
-  script_context_table->set_names_to_context_index(*names_table);
+
+  return names_table;
 }
 
-Handle<ScriptContextTable> ScriptContextTable::Extend(
+}  // namespace
+
+Handle<ScriptContextTable> ScriptContextTable::Add(
     Isolate* isolate, Handle<ScriptContextTable> table,
-    Handle<Context> script_context, bool ignore_duplicates) {
-  Handle<ScriptContextTable> result;
-  int used = table->used(kAcquireLoad);
-  int length = table->length();
-  CHECK(used >= 0 && length > 0 && used < length);
-  if (used + kFirstContextSlotIndex == length) {
-    CHECK(length < Smi::kMaxValue / 2);
-    Handle<FixedArray> copy =
-        isolate->factory()->CopyFixedArrayAndGrow(table, length);
-    copy->set_map(ReadOnlyRoots(isolate).script_context_table_map());
-    result = Handle<ScriptContextTable>::cast(copy);
-  } else {
-    result = table;
-  }
+    DirectHandle<Context> script_context, bool ignore_duplicates) {
   DCHECK(script_context->IsScriptContext());
-  ScriptContextTable::AddLocalNamesFromContext(isolate, result, script_context,
-                                               ignore_duplicates, used);
-  result->set(used + kFirstContextSlotIndex, *script_context, kReleaseStore);
-  result->set_used(used + 1, kReleaseStore);
+
+  const uint32_t old_length = table->length(kAcquireLoad).value();
+  const uint32_t new_length = old_length + 1;
+
+  Handle<ScriptContextTable> result = table;
+  const uint32_t old_capacity = table->capacity().value();
+  DCHECK_LE(old_length, old_capacity);
+  if (old_length == old_capacity) {
+    const uint32_t new_capacity = NewCapacityForIndex(old_length, old_capacity);
+    auto new_table = New(isolate, new_capacity);
+    new_table->set_length(old_length, kReleaseStore);
+    new_table->set_names_to_context_index(table->names_to_context_index());
+    CopyElements(isolate, *new_table, 0, *table, 0, old_length);
+    result = new_table;
+  }
+
+  Handle<NameToIndexHashTable> names_table(result->names_to_context_index(),
+                                           isolate);
+  names_table = AddLocalNamesFromContext(isolate, names_table, script_context,
+                                         ignore_duplicates, old_length);
+  result->set_names_to_context_index(*names_table);
+
+  result->set(old_length, *script_context, kReleaseStore);
+  result->set_length(new_length, kReleaseStore);
   return result;
 }
+
+#define CHECK_FOLLOWS2(v1, v2) static_assert((v1 + 1) == (v2))
+
+int Context::FunctionMapIndex(LanguageMode language_mode, FunctionKind kind,
+                              bool has_shared_name) {
+  if (IsClassConstructor(kind)) {
+    // Like the strict function map, but with no 'name' accessor. 'name'
+    // needs to be the last property and it is added during instantiation,
+    // in case a static property with the same name exists"
+    return CLASS_FUNCTION_MAP_INDEX;
+  }
+
+  int base = 0;
+  if (IsGeneratorFunction(kind)) {
+    CHECK_FOLLOWS2(GENERATOR_FUNCTION_MAP_INDEX,
+                   GENERATOR_FUNCTION_WITH_NAME_MAP_INDEX);
+    CHECK_FOLLOWS2(ASYNC_GENERATOR_FUNCTION_MAP_INDEX,
+                   ASYNC_GENERATOR_FUNCTION_WITH_NAME_MAP_INDEX);
+
+    base = IsAsyncFunction(kind) ? ASYNC_GENERATOR_FUNCTION_MAP_INDEX
+                                 : GENERATOR_FUNCTION_MAP_INDEX;
+
+  } else if (IsAsyncFunction(kind) || IsModuleWithTopLevelAwait(kind)) {
+    CHECK_FOLLOWS2(ASYNC_FUNCTION_MAP_INDEX,
+                   ASYNC_FUNCTION_WITH_NAME_MAP_INDEX);
+
+    base = ASYNC_FUNCTION_MAP_INDEX;
+
+  } else if (IsStrictFunctionWithoutPrototype(kind)) {
+    CHECK_FOLLOWS2(STRICT_FUNCTION_WITHOUT_PROTOTYPE_MAP_INDEX,
+                   METHOD_WITH_NAME_MAP_INDEX);
+
+    base = STRICT_FUNCTION_WITHOUT_PROTOTYPE_MAP_INDEX;
+
+  } else {
+    CHECK_FOLLOWS2(SLOPPY_FUNCTION_MAP_INDEX,
+                   SLOPPY_FUNCTION_WITH_NAME_MAP_INDEX);
+    CHECK_FOLLOWS2(STRICT_FUNCTION_MAP_INDEX,
+                   STRICT_FUNCTION_WITH_NAME_MAP_INDEX);
+
+    base = is_strict(language_mode) ? STRICT_FUNCTION_MAP_INDEX
+                                    : SLOPPY_FUNCTION_MAP_INDEX;
+  }
+  int offset = static_cast<int>(!has_shared_name);
+  DCHECK_EQ(0, offset & ~1);
+
+  return base + offset;
+}
+
+#undef CHECK_FOLLOWS2
 
 void Context::Initialize(Isolate* isolate) {
   Tagged<ScopeInfo> scope_info = this->scope_info();
   int header = scope_info->ContextHeaderLength();
   for (int var = 0; var < scope_info->ContextLocalCount(); var++) {
     if (scope_info->ContextLocalInitFlag(var) == kNeedsInitialization) {
-      set(header + var, ReadOnlyRoots(isolate).the_hole_value());
+      set(header + var, ReadOnlyRoots(isolate).tdz_hole_value());
     }
   }
 }
 
-bool ScriptContextTable::Lookup(Handle<String> name,
+bool ScriptContextTable::Lookup(DirectHandle<String> name,
                                 VariableLookupResult* result) {
   DisallowGarbageCollection no_gc;
-  int index = names_to_context_index()->Lookup(name);
-  if (index == -1) return false;
-  DCHECK_LE(0, index);
-  DCHECK_LT(index, used(kAcquireLoad));
-  Tagged<Context> context = get_context(index);
+  int int_index = names_to_context_index()->Lookup(*name);
+  if (int_index == -1) return false;
+  DCHECK_LE(0, int_index);
+  uint32_t index = static_cast<uint32_t>(int_index);
+  DCHECK_LT(index, length(kAcquireLoad).value());
+  Tagged<Context> context = get(index);
   DCHECK(context->IsScriptContext());
-  int slot_index = context->scope_info()->ContextSlotIndex(name, result);
-  if (slot_index >= 0) {
-    result->context_index = index;
-    result->slot_index = slot_index;
-    return true;
-  }
-  return false;
+  int slot_index = context->scope_info()->ContextSlotIndex(*name, result);
+  if (slot_index < 0) return false;
+  result->context_index = index;
+  result->slot_index = slot_index;
+  return true;
 }
 
 bool Context::is_declaration_context() const {
-  if (IsFunctionContext() || IsNativeContext(*this) || IsScriptContext() ||
+  if (IsFunctionContext() || Is<NativeContext>(this) || IsScriptContext() ||
       IsModuleContext()) {
     return true;
   }
@@ -104,7 +195,7 @@ bool Context::is_declaration_context() const {
 }
 
 Tagged<Context> Context::declaration_context() const {
-  Tagged<Context> current = *this;
+  Tagged<Context> current = this;
   while (!current->is_declaration_context()) {
     current = current->previous();
   }
@@ -112,7 +203,7 @@ Tagged<Context> Context::declaration_context() const {
 }
 
 Tagged<Context> Context::closure_context() const {
-  Tagged<Context> current = *this;
+  Tagged<Context> current = this;
   while (!current->IsFunctionContext() && !current->IsScriptContext() &&
          !current->IsModuleContext() && !IsNativeContext(current) &&
          !current->IsEvalContext()) {
@@ -122,43 +213,35 @@ Tagged<Context> Context::closure_context() const {
 }
 
 Tagged<JSObject> Context::extension_object() const {
-  DCHECK(IsNativeContext(*this) || IsFunctionContext() || IsBlockContext() ||
+  DCHECK(Is<NativeContext>(this) || IsFunctionContext() || IsBlockContext() ||
          IsEvalContext() || IsCatchContext());
   Tagged<HeapObject> object = extension();
-  if (IsUndefined(object)) return JSObject();
+  if (IsUndefined(object)) return {};
   DCHECK(IsJSContextExtensionObject(object) ||
-         (IsNativeContext(*this) && IsJSGlobalObject(object)));
-  return JSObject::cast(object);
+         (Is<NativeContext>(this) && IsJSGlobalObject(object)));
+  return Cast<JSObject>(object);
 }
 
 Tagged<JSReceiver> Context::extension_receiver() const {
-  DCHECK(IsNativeContext(*this) || IsWithContext() || IsEvalContext() ||
+  DCHECK(Is<NativeContext>(this) || IsWithContext() || IsEvalContext() ||
          IsFunctionContext() || IsBlockContext());
-  return IsWithContext() ? JSReceiver::cast(extension()) : extension_object();
+  return IsWithContext() ? Cast<JSReceiver>(extension()) : extension_object();
 }
 
 Tagged<SourceTextModule> Context::module() const {
-  Tagged<Context> current = *this;
+  Tagged<Context> current = this;
   while (!current->IsModuleContext()) {
     current = current->previous();
   }
-  return SourceTextModule::cast(current->extension());
-}
-
-Tagged<JSGlobalObject> Context::global_object() const {
-  return JSGlobalObject::cast(native_context()->extension());
+  return Cast<SourceTextModule>(current->extension());
 }
 
 Tagged<Context> Context::script_context() const {
-  Tagged<Context> current = *this;
+  Tagged<Context> current = this;
   while (!current->IsScriptContext()) {
     current = current->previous();
   }
   return current;
-}
-
-Tagged<JSGlobalProxy> Context::global_proxy() const {
-  return native_context()->global_proxy_object();
 }
 
 /**
@@ -171,26 +254,23 @@ static Maybe<bool> UnscopableLookup(LookupIterator* it, bool is_with_context) {
   Maybe<bool> found = JSReceiver::HasProperty(it);
   if (!is_with_context || found.IsNothing() || !found.FromJust()) return found;
 
-  Handle<Object> unscopables;
-  ASSIGN_RETURN_ON_EXCEPTION_VALUE(
+  DirectHandle<Object> unscopables;
+  ASSIGN_RETURN_ON_EXCEPTION(
       isolate, unscopables,
-      JSReceiver::GetProperty(isolate,
-                              Handle<JSReceiver>::cast(it->GetReceiver()),
-                              isolate->factory()->unscopables_symbol()),
-      Nothing<bool>());
+      JSReceiver::GetProperty(isolate, Cast<JSReceiver>(it->GetReceiver()),
+                              isolate->factory()->unscopables_symbol()));
   if (!IsJSReceiver(*unscopables)) return Just(true);
-  Handle<Object> blocklist;
-  ASSIGN_RETURN_ON_EXCEPTION_VALUE(
+  DirectHandle<Object> blocklist;
+  ASSIGN_RETURN_ON_EXCEPTION(
       isolate, blocklist,
-      JSReceiver::GetProperty(isolate, Handle<JSReceiver>::cast(unscopables),
-                              it->name()),
-      Nothing<bool>());
+      JSReceiver::GetProperty(isolate, Cast<JSReceiver>(unscopables),
+                              it->name()));
   return Just(!Object::BooleanValue(*blocklist, isolate));
 }
 
 static PropertyAttributes GetAttributesForMode(VariableMode mode) {
   DCHECK(IsSerializableVariableMode(mode));
-  return IsConstVariableMode(mode) ? READ_ONLY : NONE;
+  return IsImmutableLexicalOrPrivateVariableMode(mode) ? READ_ONLY : NONE;
 }
 
 // static
@@ -200,7 +280,7 @@ Handle<Object> Context::Lookup(Handle<Context> context, Handle<String> name,
                                InitializationFlag* init_flag,
                                VariableMode* variable_mode,
                                bool* is_sloppy_function_name) {
-  Isolate* isolate = context->GetIsolate();
+  Isolate* isolate = Isolate::Current();
 
   bool follow_context_chain = (flags & FOLLOW_CONTEXT_CHAIN) != 0;
   bool has_seen_debug_evaluate_context = false;
@@ -230,7 +310,7 @@ Handle<Object> Context::Lookup(Handle<Context> context, Handle<String> name,
 
     // 1. Check global objects, subjects of with, and extension objects.
     DCHECK_IMPLIES(context->IsEvalContext() && context->has_extension(),
-                   IsTheHole(context->extension(), isolate));
+                   IsTheHole(context->extension()));
     if ((IsNativeContext(*context) || context->IsWithContext() ||
          context->IsFunctionContext() || context->IsBlockContext()) &&
         context->has_extension() && !context->extension_receiver().is_null()) {
@@ -247,7 +327,7 @@ Handle<Object> Context::Lookup(Handle<Context> context, Handle<String> name,
         VariableLookupResult r;
         if (script_contexts->Lookup(name, &r)) {
           Tagged<Context> script_context =
-              script_contexts->get_context(r.context_index);
+              script_contexts->get(r.context_index);
           if (v8_flags.trace_contexts) {
             PrintF("=> found property in script context %d: %p\n",
                    r.context_index,
@@ -267,7 +347,7 @@ Handle<Object> Context::Lookup(Handle<Context> context, Handle<String> name,
       Maybe<PropertyAttributes> maybe = Nothing<PropertyAttributes>();
       if ((flags & FOLLOW_PROTOTYPE_CHAIN) == 0 ||
           IsJSContextExtensionObject(*object)) {
-        maybe = JSReceiver::GetOwnPropertyAttributes(object, name);
+        maybe = JSReceiver::GetOwnPropertyAttributes(isolate, object, name);
       } else {
         // A with context will never bind "this", but debug-eval may look into
         // a with context when resolving "this". Other synthetic variables such
@@ -293,7 +373,7 @@ Handle<Object> Context::Lookup(Handle<Context> context, Handle<String> name,
       }
 
       if (maybe.IsNothing()) return Handle<Object>();
-      DCHECK(!isolate->has_pending_exception());
+      DCHECK(!isolate->has_exception());
       *attributes = maybe.FromJust();
 
       if (maybe.FromJust() != ABSENT) {
@@ -314,7 +394,7 @@ Handle<Object> Context::Lookup(Handle<Context> context, Handle<String> name,
       // for the context index.
       Tagged<ScopeInfo> scope_info = context->scope_info();
       VariableLookupResult lookup_result;
-      int slot_index = scope_info->ContextSlotIndex(name, &lookup_result);
+      int slot_index = scope_info->ContextSlotIndex(*name, &lookup_result);
       DCHECK(slot_index < 0 || slot_index >= MIN_CONTEXT_SLOTS);
       if (slot_index >= 0) {
         // Re-direct lookup to the ScriptContextTable in case we find a hole in
@@ -323,7 +403,7 @@ Handle<Object> Context::Lookup(Handle<Context> context, Handle<String> name,
         // context of the first script that declared a variable, all other
         // script contexts will contain 'the hole' for that particular name.
         if (scope_info->IsReplModeScope() &&
-            IsTheHole(context->get(slot_index), isolate)) {
+            context->IsElementTdzHole(slot_index)) {
           context = Handle<Context>(context->previous(), isolate);
           continue;
         }
@@ -386,9 +466,9 @@ Handle<Object> Context::Lookup(Handle<Context> context, Handle<String> name,
       has_seen_debug_evaluate_context = true;
 
       // Check materialized locals.
-      Tagged<Object> ext = context->get(EXTENSION_INDEX);
+      Tagged<Object> ext = context->get(EXTENSION_INDEX, kRelaxedLoad);
       if (IsJSReceiver(ext)) {
-        Handle<JSReceiver> extension(JSReceiver::cast(ext), isolate);
+        Handle<JSReceiver> extension(Cast<JSReceiver>(ext), isolate);
         LookupIterator it(isolate, extension, name, extension);
         Maybe<bool> found = JSReceiver::HasProperty(&it);
         if (found.FromMaybe(false)) {
@@ -398,9 +478,9 @@ Handle<Object> Context::Lookup(Handle<Context> context, Handle<String> name,
       }
 
       // Check the original context, but do not follow its context chain.
-      Tagged<Object> obj = context->get(WRAPPED_CONTEXT_INDEX);
+      Tagged<Object> obj = context->get(WRAPPED_CONTEXT_INDEX, kRelaxedLoad);
       if (IsContext(obj)) {
-        Handle<Context> wrapped_context(Context::cast(obj), isolate);
+        Handle<Context> wrapped_context(Cast<Context>(obj), isolate);
         Handle<Object> result =
             Context::Lookup(wrapped_context, name, DONT_FOLLOW_CHAINS, index,
                             attributes, init_flag, variable_mode);
@@ -419,11 +499,12 @@ Handle<Object> Context::Lookup(Handle<Context> context, Handle<String> name,
     // `has_seen_debug_evaluate_context` will always be false.
     if (has_seen_debug_evaluate_context &&
         IsEphemeronHashTable(isolate->heap()->locals_block_list_cache())) {
-      Handle<ScopeInfo> scope_info = handle(context->scope_info(), isolate);
-      Tagged<Object> maybe_outer_block_list =
+      DirectHandle<ScopeInfo> scope_info =
+          direct_handle(context->scope_info(), isolate);
+      Tagged<UnionOf<TheHole, StringSet>> maybe_outer_block_list =
           isolate->LocalsBlockListCacheGet(scope_info);
-      if (IsStringSet(maybe_outer_block_list) &&
-          StringSet::cast(maybe_outer_block_list)->Has(isolate, name)) {
+      if (!IsTheHole(maybe_outer_block_list) &&
+          Cast<StringSet>(maybe_outer_block_list)->Has(isolate, name)) {
         if (v8_flags.trace_contexts) {
           PrintF(" - name is blocklisted. Aborting.\n");
         }
@@ -440,51 +521,219 @@ Handle<Object> Context::Lookup(Handle<Context> context, Handle<String> name,
   return Handle<Object>::null();
 }
 
+namespace {
+std::optional<int32_t> DoubleFitsInInt32(double value) {
+  constexpr double int32_min = std::numeric_limits<int32_t>::min();
+  constexpr double int32_max = std::numeric_limits<int32_t>::max();
+  // Check -0.0 first.
+  if (value == 0.0 && std::signbit(value)) return {};
+  double trunc_value = std::trunc(value);
+  if (int32_min <= value && value <= int32_max && value == trunc_value) {
+    return static_cast<int32_t>(trunc_value);
+  }
+  return {};
+}
+
+V8_INLINE bool IsEmptyDependentCode(Tagged<DependentCode> value,
+                                    Isolate* isolate) {
+  return value == DependentCode::empty_dependent_code(ReadOnlyRoots(isolate));
+}
+
+V8_INLINE void NotifyContextCellStateWillChange(DirectHandle<ContextCell> cell,
+                                                Isolate* isolate) {
+  if (!IsEmptyDependentCode(cell->dependent_code(), isolate)) {
+    DependentCode::DeoptimizeDependencyGroups(
+        isolate, *cell, DependentCode::kContextCellChangedGroup);
+  }
+}
+
+V8_INLINE void TransitionContextCellToUntagged(Tagged<HeapNumber> number,
+                                               DirectHandle<ContextCell> cell) {
+  double double_value = number->value();
+  if (auto int32_value = DoubleFitsInInt32(double_value)) {
+    cell->set_int32_value(*int32_value);
+    cell->set_state(ContextCell::kInt32);
+  } else {
+    cell->set_float64_value(double_value);
+    cell->set_state(ContextCell::kFloat64);
+  }
+}
+
+}  // namespace
+
+// static
+DirectHandle<Object> Context::Get(DirectHandle<Context> context, int index,
+                                  Isolate* isolate) {
+  DirectHandle<Object> value =
+      handle(context->get(index, kRelaxedLoad), isolate);
+#ifdef V8_ENABLE_TDZ_HOLE
+  DCHECK(!IsTheHole(*value));
+#endif
+  if (IsTdzHole(*value) || !Is<ContextCell>(value)) {
+    return value;
+  }
+  DCHECK(context->HasContextCells());
+  DirectHandle<ContextCell> cell = Cast<ContextCell>(value);
+  switch (cell->state()) {
+    case ContextCell::kConst:
+    case ContextCell::kSmi:
+      return handle(cell->tagged_value(), isolate);
+    case ContextCell::kInt32:
+      if (Smi::IsValid(cell->int32_value())) {
+        return handle(Smi::FromInt(cell->int32_value()), isolate);
+      }
+      return isolate->factory()->NewHeapNumber(
+          static_cast<double>(cell->int32_value()));
+    case ContextCell::kFloat64:
+      return isolate->factory()->NewHeapNumber(cell->float64_value());
+    case ContextCell::kDetached:
+      UNREACHABLE();
+  }
+  UNREACHABLE();
+}
+
+// static
+void Context::Set(DirectHandle<Context> context, int index,
+                  DirectHandle<Object> new_value, Isolate* isolate) {
+  DirectHandle<Object> old_value(context->get(index, kRelaxedLoad), isolate);
+#ifdef V8_ENABLE_TDZ_HOLE
+  DCHECK(!IsTheHole(*old_value));
+  DCHECK(!IsTheHole(*new_value));
+#endif
+  if (!context->HasContextCells()) {
+    context->set(index, *new_value);
+    return;
+  }
+
+  if (IsTdzHole(*old_value)) {
+    // Setting the initial value.
+    DirectHandle<ContextCell> cell =
+        isolate->factory()->NewContextCell(Cast<JSAny>(new_value));
+    context->set(index, *cell);
+    return;
+  }
+
+  if (!Is<ContextCell>(old_value)) {
+    context->set(index, *new_value);
+    return;
+  }
+
+  if (IsUndefinedContextCell(*old_value)) {
+    if (IsUndefined(*new_value)) return;
+    if (IsTdzHole(*new_value)) {
+      // This can happened in let-variable in function contexts.
+      context->set(index, *new_value);
+      return;
+    }
+    DirectHandle<ContextCell> cell =
+        isolate->factory()->NewContextCell(Cast<JSAny>(new_value));
+    context->set(index, *cell);
+    return;
+  }
+
+  DirectHandle<ContextCell> cell = Cast<ContextCell>(old_value);
+  switch (cell->state()) {
+    case ContextCell::kConst:
+      // If we are assigning the same value, the property won't change.
+      if (cell->tagged_value() == *new_value) {
+        return;
+      }
+      // If both values are HeapNumbers with the same double value, the property
+      // won't change either.
+      if (Is<HeapNumber>(cell->tagged_value()) && Is<HeapNumber>(*new_value)) {
+        double old_number = Cast<HeapNumber>(cell->tagged_value())->value();
+        double new_number = Cast<HeapNumber>(*new_value)->value();
+        if (old_number == new_number && old_number != 0) {
+          return;
+        }
+      }
+      NotifyContextCellStateWillChange(cell, isolate);
+      if (Is<Smi>(*new_value)) {
+        cell->set_smi_value(Cast<Smi>(*new_value));
+        cell->set_state(ContextCell::kSmi);
+      } else if (IsHeapNumber(*new_value)) {
+        TransitionContextCellToUntagged(Cast<HeapNumber>(*new_value), cell);
+        cell->clear_tagged_value();
+      } else {
+        context->set(index, *new_value);
+        cell->clear_tagged_value();
+        cell->set_state(ContextCell::kDetached);
+      }
+      return;
+    case ContextCell::kSmi:
+      if (IsSmi(*new_value)) {
+        cell->set_smi_value(Cast<Smi>(*new_value));
+        cell->set_state(ContextCell::kSmi);
+      } else {
+        NotifyContextCellStateWillChange(cell, isolate);
+        if (IsHeapNumber(*new_value)) {
+          TransitionContextCellToUntagged(Cast<HeapNumber>(*new_value), cell);
+        } else {
+          context->set(index, *new_value);
+          cell->set_state(ContextCell::kDetached);
+        }
+        cell->clear_tagged_value();
+      }
+      return;
+    case ContextCell::kInt32:
+      if (IsSmi(*new_value)) {
+        cell->set_int32_value(Cast<Smi>(*new_value).value());
+        cell->set_state(ContextCell::kInt32);
+      } else if (IsHeapNumber(*new_value)) {
+        double double_value = Cast<HeapNumber>(*new_value)->value();
+        if (auto int32_value = DoubleFitsInInt32(double_value)) {
+          cell->set_int32_value(*int32_value);
+          cell->set_state(ContextCell::kInt32);
+        } else {
+          NotifyContextCellStateWillChange(cell, isolate);
+          cell->set_float64_value(double_value);
+          cell->set_state(ContextCell::kFloat64);
+        }
+      } else {
+        NotifyContextCellStateWillChange(cell, isolate);
+        context->set(index, *new_value);
+        cell->set_state(ContextCell::kDetached);
+      }
+      return;
+    case ContextCell::kFloat64:
+      if (IsSmi(*new_value)) {
+        cell->set_float64_value(
+            static_cast<double>(Cast<Smi>(*new_value).value()));
+        cell->set_state(ContextCell::kFloat64);
+      } else if (IsHeapNumber(*new_value)) {
+        cell->set_float64_value(Cast<HeapNumber>(*new_value)->value());
+        cell->set_state(ContextCell::kFloat64);
+      } else {
+        NotifyContextCellStateWillChange(cell, isolate);
+        context->set(index, *new_value);
+        cell->set_state(ContextCell::kDetached);
+      }
+      return;
+    case ContextCell::kDetached:
+      UNREACHABLE();
+  }
+  UNREACHABLE();
+}
+
 bool NativeContext::HasTemplateLiteralObject(Tagged<JSArray> array) {
   return array->map() == js_array_template_literal_object_map();
 }
 
 Handle<Object> Context::ErrorMessageForCodeGenerationFromStrings() {
-  Isolate* isolate = GetIsolate();
+  Isolate* isolate = Isolate::Current();
   Handle<Object> result(error_message_for_code_gen_from_strings(), isolate);
-  if (!IsUndefined(*result, isolate)) return result;
+  if (!IsUndefined(*result)) return result;
   return isolate->factory()->NewStringFromStaticChars(
       "Code generation from strings disallowed for this context");
 }
 
-Handle<Object> Context::ErrorMessageForWasmCodeGeneration() {
-  Isolate* isolate = GetIsolate();
-  Handle<Object> result(error_message_for_wasm_code_gen(), isolate);
-  if (!IsUndefined(*result, isolate)) return result;
+DirectHandle<Object> Context::ErrorMessageForWasmCodeGeneration() {
+  Isolate* isolate = Isolate::Current();
+  DirectHandle<Object> result(error_message_for_wasm_code_gen(), isolate);
+  if (!IsUndefined(*result)) return result;
   return isolate->factory()->NewStringFromStaticChars(
       "Wasm code generation disallowed by embedder");
 }
-
-#define COMPARE_NAME(index, type, name) \
-  if (string->IsOneByteEqualTo(base::StaticCharVector(#name))) return index;
-
-int Context::IntrinsicIndexForName(Handle<String> string) {
-  NATIVE_CONTEXT_INTRINSIC_FUNCTIONS(COMPARE_NAME);
-  return kNotFound;
-}
-
-#undef COMPARE_NAME
-
-#define COMPARE_NAME(index, type, name)                                      \
-  {                                                                          \
-    const int name_length = static_cast<int>(arraysize(#name)) - 1;          \
-    if ((length == name_length) && strncmp(string, #name, name_length) == 0) \
-      return index;                                                          \
-  }
-
-int Context::IntrinsicIndexForName(const unsigned char* unsigned_string,
-                                   int length) {
-  const char* string = reinterpret_cast<const char*>(unsigned_string);
-  NATIVE_CONTEXT_INTRINSIC_FUNCTIONS(COMPARE_NAME);
-  return kNotFound;
-}
-
-#undef COMPARE_NAME
 
 #ifdef VERIFY_HEAP
 namespace {
@@ -493,7 +742,7 @@ namespace {
 // extensions.
 bool IsContexExtensionTestObject(Tagged<HeapObject> extension) {
   return IsInternalizedString(extension) &&
-         String::cast(extension)->length() == 1;
+         Cast<String>(extension)->length() == 1;
 }
 }  // namespace
 
@@ -509,7 +758,7 @@ void Context::VerifyExtensionSlot(Tagged<HeapObject> extension) {
   } else if (IsDebugEvaluateContext() || IsWithContext()) {
     CHECK(IsJSReceiver(extension) ||
           (IsWithContext() && IsContexExtensionTestObject(extension)));
-  } else if (IsNativeContext(*this)) {
+  } else if (Is<NativeContext>(this)) {
     CHECK(IsJSGlobalObject(extension) ||
           IsContexExtensionTestObject(extension));
   } else if (IsScriptContext()) {
@@ -533,9 +782,9 @@ bool Context::IsBootstrappingOrValidParentContext(Tagged<Object> object,
                                                   Tagged<Context> child) {
   // During bootstrapping we allow all objects to pass as
   // contexts. This is necessary to fix circular dependencies.
-  if (child->GetIsolate()->bootstrapper()->IsActive()) return true;
+  if (Isolate::Current()->bootstrapper()->IsActive()) return true;
   if (!IsContext(object)) return false;
-  Tagged<Context> context = Context::cast(object);
+  Tagged<Context> context = Cast<Context>(object);
   return IsNativeContext(context) || context->IsScriptContext() ||
          context->IsModuleContext() || !child->IsModuleContext();
 }
@@ -560,21 +809,19 @@ static_assert(NativeContext::kPreviousOffset ==
 static_assert(NativeContext::kExtensionOffset ==
               Context::OffsetOfElementAt(NativeContext::EXTENSION_INDEX));
 
-static_assert(NativeContext::kStartOfStrongFieldsOffset ==
-              Context::OffsetOfElementAt(-1));
 static_assert(NativeContext::kStartOfWeakFieldsOffset ==
               Context::OffsetOfElementAt(NativeContext::FIRST_WEAK_SLOT));
 static_assert(NativeContext::kMicrotaskQueueOffset ==
               Context::SizeFor(NativeContext::NATIVE_CONTEXT_SLOTS));
 static_assert(NativeContext::kSize ==
               (Context::SizeFor(NativeContext::NATIVE_CONTEXT_SLOTS) +
-               kSystemPointerSize));
+               NativeContext::kMicrotaskQueueSlotSize));
 
 #ifdef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
 void NativeContext::RunPromiseHook(PromiseHookType type,
-                                   Handle<JSPromise> promise,
-                                   Handle<Object> parent) {
-  Isolate* isolate = promise->GetIsolate();
+                                   DirectHandle<JSPromise> promise,
+                                   DirectHandle<Object> parent) {
+  Isolate* isolate = Isolate::Current();
   DCHECK(isolate->HasContextPromiseHooks());
   int contextSlot;
 
@@ -595,16 +842,14 @@ void NativeContext::RunPromiseHook(PromiseHookType type,
       UNREACHABLE();
   }
 
-  Handle<Object> hook(isolate->native_context()->get(contextSlot), isolate);
+  DirectHandle<Object> hook(isolate->native_context()->GetNoCell(contextSlot),
+                            isolate);
   if (IsUndefined(*hook)) return;
 
-  int argc = type == PromiseHookType::kInit ? 2 : 1;
-  Handle<Object> argv[2] = {
-    Handle<Object>::cast(promise),
-    parent
-  };
+  size_t argc = type == PromiseHookType::kInit ? 2 : 1;
+  DirectHandle<Object> argv[2] = {Cast<Object>(promise), parent};
 
-  Handle<Object> receiver = isolate->global_proxy();
+  DirectHandle<Object> receiver = isolate->global_proxy();
 
   StackLimitCheck check(isolate);
   bool failed = false;
@@ -612,21 +857,20 @@ void NativeContext::RunPromiseHook(PromiseHookType type,
     isolate->StackOverflow();
     failed = true;
   } else {
-    failed = Execution::Call(isolate, hook, receiver, argc, argv).is_null();
+    failed = Execution::Call(isolate, hook, receiver, {argv, argc}).is_null();
   }
   if (failed) {
-    DCHECK(isolate->has_pending_exception());
-    Handle<Object> exception(isolate->pending_exception(), isolate);
+    DCHECK(isolate->has_exception());
+    DirectHandle<Object> exception(isolate->exception(), isolate);
 
     MessageLocation* no_location = nullptr;
-    Handle<JSMessageObject> message =
+    DirectHandle<JSMessageObject> message =
         isolate->CreateMessageOrAbort(exception, no_location);
     MessageHandler::ReportMessage(isolate, no_location, message);
 
-    isolate->clear_pending_exception();
+    isolate->clear_exception();
   }
 }
-#endif
+#endif  // V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
 
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal

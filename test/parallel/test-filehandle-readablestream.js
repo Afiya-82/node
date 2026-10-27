@@ -87,11 +87,11 @@ const check = readFileSync(__filename, { encoding: 'utf8' });
   await file.close();
 })().then(common.mustCall());
 
-// Make sure 'bytes' stream works
+// Make sure 'byob' reader works
 (async () => {
   const file = await open(__filename);
   const dec = new TextDecoder();
-  const readable = file.readableWebStream({ type: 'bytes' });
+  const readable = file.readableWebStream();
   const reader = readable.getReader({ mode: 'byob' });
 
   let data = '';
@@ -114,59 +114,47 @@ const check = readFileSync(__filename, { encoding: 'utf8' });
   await file.close();
 })().then(common.mustCall());
 
-// Make sure that acquiring a ReadableStream 'bytes' stream
-// fails if the FileHandle is already closed.
+// Make sure 'byob' reader works with views into
+// different parts of a single ArrayBuffer
 (async () => {
   const file = await open(__filename);
+  const dec = new TextDecoder();
+  const readable = file.readableWebStream();
+  const reader = readable.getReader({ mode: 'byob' });
+  const size = (await file.stat()).size;
+
+  let buff = new ArrayBuffer(size);
+  let offset = 0;
+  let result;
+  do {
+    result = await reader.read(new DataView(buff, offset, Math.min(100, buff.byteLength - offset)));
+    if (result.value !== undefined) {
+      buff = result.value.buffer;
+      offset += result.value.byteLength;
+      assert.ok(result.value.byteLength <= 100);
+    }
+  } while (!result.done && (offset < buff.byteLength));
+  const data = dec.decode(new Uint8Array(buff));
+
+  assert.strictEqual(check, data);
+
+  assert.throws(() => file.readableWebStream(), {
+    code: 'ERR_INVALID_STATE',
+  });
+
   await file.close();
+})().then(common.mustCall());
 
-  assert.throws(() => file.readableWebStream({ type: 'bytes' }), {
-    code: 'ERR_INVALID_STATE',
+// Make sure a warning is logged if a non-'bytes' type is passed.
+(async () => {
+  const file = await open(__filename);
+  common.expectWarning({
+    ExperimentalWarning: [
+      'A non-"bytes" options.type has no effect. A byte-oriented steam is ' +
+      'always created.',
+    ],
   });
-})().then(common.mustCall());
-
-// Make sure that acquiring a ReadableStream 'bytes' stream
-// fails if the FileHandle is already closing.
-(async () => {
-  const file = await open(__filename);
-  file.close();
-
-  assert.throws(() => file.readableWebStream({ type: 'bytes' }), {
-    code: 'ERR_INVALID_STATE',
-  });
-})().then(common.mustCall());
-
-// Make sure the 'bytes' ReadableStream is closed when the underlying
-// FileHandle is closed.
-(async () => {
-  const file = await open(__filename);
-  const readable = file.readableWebStream({ type: 'bytes' });
-  const reader = readable.getReader({ mode: 'byob' });
-  file.close();
-  await reader.closed;
-})().then(common.mustCall());
-
-// Make sure the 'bytes' ReadableStream is closed when the underlying
-// FileHandle is closed.
-(async () => {
-  const file = await open(__filename);
-  const readable = file.readableWebStream({ type: 'bytes' });
-  file.close();
-  const reader = readable.getReader({ mode: 'byob' });
-  await reader.closed;
-})().then(common.mustCall());
-
-// Make sure that the FileHandle is properly marked "in use"
-// when a 'bytes' ReadableStream has been acquired for it.
-(async () => {
-  const file = await open(__filename);
-  file.readableWebStream({ type: 'bytes' });
-  const mc = new MessageChannel();
-  mc.port1.onmessage = common.mustNotCall();
-  assert.throws(() => mc.port2.postMessage(file, [file]), {
-    code: 25,
-    name: 'DataCloneError',
-  });
-  mc.port1.close();
+  const stream = file.readableWebStream({ type: 'foobar' });
+  await stream.cancel();
   await file.close();
 })().then(common.mustCall());

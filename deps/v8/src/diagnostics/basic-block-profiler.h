@@ -5,12 +5,14 @@
 #ifndef V8_DIAGNOSTICS_BASIC_BLOCK_PROFILER_H_
 #define V8_DIAGNOSTICS_BASIC_BLOCK_PROFILER_H_
 
+#include <cstdint>
 #include <iosfwd>
 #include <list>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "src/base/functional/function-ref.h"
 #include "src/base/macros.h"
 #include "src/base/platform/mutex.h"
 #include "src/common/globals.h"
@@ -25,7 +27,8 @@ class BasicBlockProfilerData {
  public:
   explicit BasicBlockProfilerData(size_t n_blocks);
   V8_EXPORT_PRIVATE BasicBlockProfilerData(
-      Handle<OnHeapBasicBlockProfilerData> js_heap_data, Isolate* isolate);
+      DirectHandle<OnHeapBasicBlockProfilerData> js_heap_data,
+      Isolate* isolate);
   V8_EXPORT_PRIVATE BasicBlockProfilerData(
       Tagged<OnHeapBasicBlockProfilerData> js_heap_data);
 
@@ -48,7 +51,7 @@ class BasicBlockProfilerData {
   // Copy the data from this object into an equivalent object stored on the JS
   // heap, so that it can survive snapshotting and relocation. This must
   // happen on the main thread during finalization of the compilation.
-  Handle<OnHeapBasicBlockProfilerData> CopyToJSHeap(Isolate* isolate);
+  DirectHandle<OnHeapBasicBlockProfilerData> CopyToJSHeap(Isolate* isolate);
 
   void Log(Isolate* isolate, std::ostream& os);
 
@@ -91,6 +94,14 @@ class BasicBlockProfiler {
   // data. It is used to export coverage of builtins function loaded from
   // snapshot.
   V8_EXPORT_PRIVATE std::vector<bool> GetCoverageBitmap(Isolate* isolate);
+
+  // Fast zero-allocation count of total basic blocks across all builtins.
+  V8_EXPORT_PRIVATE uint32_t GetBuiltinsBlockCount(Isolate* isolate);
+
+  // Fast single-pass zero-allocation method to iterate over executed basic
+  // blocks across all builtins and reset block counters back to zero.
+  V8_EXPORT_PRIVATE void ForEachExecutedBlockAndReset(
+      Isolate* isolate, base::FunctionRef<void(uint32_t block_index)> callback);
 
   const DataList* data_list() { return &data_list_; }
 

@@ -9,8 +9,11 @@ const { Buffer } = require('buffer');
 const assert = require('assert');
 const { crypto } = globalThis;
 
+for (const value of [undefined, null, '', 1, {}, [], new ArrayBuffer(1)]) {
+  assert.throws(() => crypto.getRandomValues(value), TypeError);
+}
+
 [
-  undefined, null, '', 1, {}, [],
   new Float32Array(1),
   new Float64Array(1),
   new DataView(new ArrayBuffer(1)),
@@ -65,7 +68,15 @@ for (const ctor of intTypedConstructors) {
   if (kData !== undefined) {
     assert.throws(
       () => crypto.getRandomValues(kData),
-      { name: 'QuotaExceededError', code: 22 },
+      (err) => {
+        assert.strictEqual(err.name, 'QuotaExceededError');
+        assert.strictEqual(err.code, 22);
+        assert(err instanceof DOMException);
+        assert(err instanceof QuotaExceededError);
+        assert.strictEqual(err.quota, null);
+        assert.strictEqual(err.requested, null);
+        return true;
+      },
     );
   }
 }

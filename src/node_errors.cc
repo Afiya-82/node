@@ -1,5 +1,6 @@
 #include <cerrno>
 #include <cstdarg>
+#include <filesystem>
 #include <sstream>
 
 #include "debug_utils-inl.h"
@@ -64,7 +65,7 @@ static std::string GetSourceMapErrorSource(Isolate* isolate,
   // the source texts.
   Local<Value> script_resource_name = message->GetScriptResourceName();
   int linenum = message->GetLineNumber(context).FromJust();
-  int columnum = message->GetStartColumn(context).FromJust();
+  int columnum = message->GetStartColumn();
 
   Local<Value> argv[] = {script_resource_name,
                          v8::Int32::New(isolate, linenum),
@@ -135,30 +136,31 @@ static std::string GetErrorSource(Isolate* isolate,
 
   // Print (filename):(line number): (message).
   ScriptOrigin origin = message->GetScriptOrigin();
-  node::Utf8Value filename(isolate, message->GetScriptResourceName());
-  const char* filename_string = *filename;
+  std::string filename_string;
+  if (message->GetScriptResourceName()->IsUndefined()) {
+    filename_string = "<anonymous_script>";
+  } else {
+    node::Utf8Value filename(isolate, message->GetScriptResourceName());
+    filename_string = filename.ToString();
+  }
   int linenum = message->GetLineNumber(context).FromJust();
 
   int script_start = (linenum - origin.LineOffset()) == 1
                          ? origin.ColumnOffset()
                          : 0;
-  int start = message->GetStartColumn(context).FromMaybe(0);
-  int end = message->GetEndColumn(context).FromMaybe(0);
-  if (start >= script_start) {
-    CHECK_GE(end, start);
+  int start = message->GetStartColumn();
+  int end = message->GetEndColumn();
+  if (start >= script_start && end >= script_start) {
     start -= script_start;
     end -= script_start;
   }
 
-  std::string buf = SPrintF("%s:%i\n%s\n",
-                            filename_string,
-                            linenum,
-                            sourceline.c_str());
+  std::string buf =
+      SPrintF("%s:%i\n%s\n", filename_string, linenum, sourceline);
   CHECK_GT(buf.size(), 0);
   *added_exception_line = true;
 
-  if (start > end ||
-      start < 0 ||
+  if (start > end || start < 0 || end < 0 ||
       static_cast<size_t>(end) > sourceline.size()) {
     return buf;
   }
@@ -188,7 +190,12 @@ static std::string GetErrorSource(Isolate* isolate,
 }
 
 static std::atomic<bool> is_in_oom{false};
-static std::atomic<bool> is_retrieving_js_stacktrace{false};
+// NOLINTNEXTLINE(runtime/thread_local)
+static thread_local std::atomic<bool> is_retrieving_js_stacktrace{false};
+// This is thread-local because it only guards re-entrancy within the current
+// thread's uncaught-exception path; no cross-thread synchronization is needed.
+// NOLINTNEXTLINE(runtime/thread_local)
+static thread_local bool is_in_uncaught_exception = false;
 MaybeLocal<StackTrace> GetCurrentStackTrace(Isolate* isolate, int frame_count) {
   if (isolate == nullptr) {
     return MaybeLocal<StackTrace>();
@@ -216,9 +223,6 @@ MaybeLocal<StackTrace> GetCurrentStackTrace(Isolate* isolate, int frame_count) {
       StackTrace::CurrentStackTrace(isolate, frame_count, options);
 
   is_retrieving_js_stacktrace.store(false);
-  if (stack->GetFrameCount() == 0) {
-    return MaybeLocal<StackTrace>();
-  }
 
   return scope.Escape(stack);
 }
@@ -291,22 +295,40 @@ void PrintStackTrace(Isolate* isolate,
   PrintToStderrAndFlush(FormatStackTrace(isolate, stack, prefix));
 }
 
+void PrintCurrentStackTrace(Isolate* isolate, StackTracePrefix prefix) {
+  Local<StackTrace> stack;
+  if (GetCurrentStackTrace(isolate).ToLocal(&stack) &&
+      stack->GetFrameCount() > 0) {
+    PrintStackTrace(isolate, stack, prefix);
+  }
+}
+
 std::string FormatCaughtException(Isolate* isolate,
                                   Local<Context> context,
                                   Local<Value> err,
                                   Local<Message> message,
                                   bool add_source_line = true) {
-  std::string result;
   node::Utf8Value reason(isolate,
                          err->ToDetailString(context)
                              .FromMaybe(Local<String>()));
+  std::string reason_str = reason.ToString();
+  return FormatErrorMessage(
+      isolate, context, reason_str, message, add_source_line);
+}
+
+std::string FormatErrorMessage(Isolate* isolate,
+                               Local<Context> context,
+                               const std::string& reason,
+                               Local<Message> message,
+                               bool add_source_line) {
+  std::string result;
   if (add_source_line) {
     bool added_exception_line = false;
     std::string source =
         GetErrorSource(isolate, context, message, &added_exception_line);
     result = source + '\n';
   }
-  result += reason.ToString() + '\n';
+  result += reason + '\n';
 
   Local<v8::StackTrace> stack = message->GetStackTrace();
   if (!stack.IsEmpty()) result += FormatStackTrace(isolate, stack);
@@ -376,14 +398,31 @@ void AppendExceptionLine(Environment* env,
             .FromMaybe(false));
 }
 
-[[noreturn]] void Abort() {
+namespace {
+// Default handler: Dumps native + JS backtraces to stderr and exits. This
+// indirectly calls backtrace so it can not be marked as [[noreturn]] (see the
+// comment on node::Assert() below). `message` and `location` are ignored
+// because the assertion/fatal-error message, if any, is already printed to
+// stderr by the caller (Assert()/OnFatalError()) before this handler runs.
+void DefaultAbortHandler(const char* /*location*/, const char* /*message*/) {
   DumpNativeBacktrace(stderr);
   DumpJavaScriptBacktrace(stderr);
   fflush(stderr);
   ABORT_NO_BACKTRACE();
 }
+// Constant-initialized, so this is valid from load time, safe even for a
+// CHECK() during early startup, before any SetAbortHandler call.
+AbortHandler g_abort_handler = DefaultAbortHandler;
+}  // namespace
 
-[[noreturn]] void Assert(const AssertionInfo& info) {
+void SetAbortHandler(AbortHandler handler) {
+  g_abort_handler = handler ? handler : DefaultAbortHandler;
+}
+AbortHandler GetAbortHandler() {
+  return g_abort_handler;
+}
+
+void Assert(const AssertionInfo& info) {
   std::string name = GetHumanReadableProcessName();
 
   fprintf(stderr,
@@ -396,7 +435,7 @@ void AppendExceptionLine(Environment* env,
           info.message);
 
   fflush(stderr);
-  Abort();
+  ABORT_WITH_DETAILS(info.file_line, info.message);
 }
 
 enum class EnhanceFatalException { kEnhance, kDontEnhance };
@@ -404,7 +443,7 @@ enum class EnhanceFatalException { kEnhance, kDontEnhance };
 /**
  * Report the exception to the inspector, then print it to stderr.
  * This should only be used when the Node.js instance is about to exit
- * (i.e. this should be followed by a env->Exit() or an Abort()).
+ * (i.e. this should be followed by a env->Exit() or an ABORT()).
  *
  * Use enhance_stack = EnhanceFatalException::kDontEnhance
  * when it's unsafe to call into JavaScript.
@@ -528,15 +567,16 @@ static void ReportFatalException(Environment* env,
       std::string argv0;
       if (!env->argv().empty()) argv0 = env->argv()[0];
       if (argv0.empty()) argv0 = "node";
+      auto filesystem_path = std::filesystem::path(argv0).replace_extension();
       FPrintF(stderr,
               "(Use `%s --trace-uncaught ...` to show where the exception "
               "was thrown)\n",
-              fs::Basename(argv0, ".exe"));
+              filesystem_path.filename().string());
     }
   }
 
   if (env->isolate_data()->options()->report_uncaught_exception) {
-    TriggerNodeReport(env, report_message.c_str(), "Exception", "", error);
+    TriggerNodeReport(env, report_message, "Exception", "", error);
   }
 
   if (env->options()->trace_uncaught) {
@@ -573,11 +613,10 @@ static void ReportFatalException(Environment* env,
   }
 
   fflush(stderr);
-  ABORT();
+  ABORT_WITH_DETAILS(location, message);
 }
 
-[[noreturn]] void OOMErrorHandler(const char* location,
-                                  const v8::OOMDetails& details) {
+void OOMErrorHandler(const char* location, const v8::OOMDetails& details) {
   // We should never recover from this handler so once it's true it's always
   // true.
   is_in_oom.store(true);
@@ -588,6 +627,9 @@ static void ReportFatalException(Environment* env,
     FPrintF(stderr, "FATAL ERROR: %s %s\n", location, message);
   } else {
     FPrintF(stderr, "FATAL ERROR: %s\n", message);
+  }
+  if (details.detail != nullptr) {
+    FPrintF(stderr, "Reason: %s\n", details.detail);
   }
 
   Isolate* isolate = Isolate::TryGetCurrent();
@@ -607,17 +649,27 @@ static void ReportFatalException(Environment* env,
   }
 
   fflush(stderr);
-  ABORT();
+  ABORT_WITH_DETAILS(location, message);
 }
 
 v8::ModifyCodeGenerationFromStringsResult ModifyCodeGenerationFromStrings(
     v8::Local<v8::Context> context,
     v8::Local<v8::Value> source,
     bool is_code_like) {
-  HandleScope scope(context->GetIsolate());
+  HandleScope scope(Isolate::GetCurrent());
 
+  if (context->GetNumberOfEmbedderDataFields() <=
+      ContextEmbedderIndex::kAllowCodeGenerationFromStrings) {
+    // The context is not (yet) configured by Node.js for this. We don't
+    // have enough information to make a decision, just allow it which is
+    // the default.
+    return {true, {}};
+  }
   Environment* env = Environment::GetCurrent(context);
-  if (env->source_maps_enabled()) {
+  if (env == nullptr) {
+    return {true, {}};
+  }
+  if (env->source_maps_enabled() && env->can_call_into_js()) {
     // We do not expect the maybe_cache_generated_source_map to throw any more
     // exceptions. If it does, just ignore it.
     errors::TryCatchScope try_catch(env);
@@ -642,13 +694,52 @@ v8::ModifyCodeGenerationFromStringsResult ModifyCodeGenerationFromStrings(
   };
 }
 
+// Check if an exception is a stack overflow error (RangeError with
+// "Maximum call stack size exceeded" message). This is used to handle
+// stack overflow specially in TryCatchScope - instead of immediately
+// exiting, we can use the red zone to re-throw to user code.
+static bool IsStackOverflowError(Isolate* isolate, Local<Value> exception) {
+  if (!exception->IsNativeError()) return false;
+
+  Local<Object> err_obj = exception.As<Object>();
+  Local<String> constructor_name = err_obj->GetConstructorName();
+
+  // Must be a RangeError
+  Utf8Value name(isolate, constructor_name);
+  if (name.ToStringView() != "RangeError") return false;
+
+  // Check for the specific stack overflow message
+  Local<Context> context = isolate->GetCurrentContext();
+  Local<Value> message_val;
+  if (!err_obj->Get(context, String::NewFromUtf8Literal(isolate, "message"))
+           .ToLocal(&message_val)) {
+    return false;
+  }
+
+  if (!message_val->IsString()) return false;
+
+  Utf8Value message(isolate, message_val.As<String>());
+  return message.ToStringView() == "Maximum call stack size exceeded";
+}
+
 namespace errors {
 
 TryCatchScope::~TryCatchScope() {
-  if (HasCaught() && !HasTerminated() && mode_ == CatchMode::kFatal) {
+  if (HasCaught() && !HasTerminated() && mode_ != CatchMode::kNormal) {
     HandleScope scope(env_->isolate());
     Local<v8::Value> exception = Exception();
     Local<v8::Message> message = Message();
+
+    // Special handling for stack overflow errors in async_hooks: instead of
+    // immediately exiting, re-throw the exception. This allows the exception
+    // to propagate to user code's try-catch blocks.
+    if (mode_ == CatchMode::kFatalRethrowStackOverflow &&
+        IsStackOverflowError(env_->isolate(), exception)) {
+      ReThrow();
+      Reset();
+      return;
+    }
+
     EnhanceFatalException enhance = CanContinue() ?
         EnhanceFatalException::kEnhance : EnhanceFatalException::kDontEnhance;
     if (message.IsEmpty())
@@ -987,7 +1078,7 @@ const char* errno_string(int errorno) {
 }
 
 void PerIsolateMessageListener(Local<Message> message, Local<Value> error) {
-  Isolate* isolate = message->GetIsolate();
+  Isolate* isolate = Isolate::GetCurrent();
   switch (message->ErrorLevel()) {
     case Isolate::MessageErrorLevel::kMessageWarning: {
       Environment* env = Environment::GetCurrent(isolate);
@@ -995,21 +1086,65 @@ void PerIsolateMessageListener(Local<Message> message, Local<Value> error) {
         break;
       }
       Utf8Value filename(isolate, message->GetScriptOrigin().ResourceName());
+      Utf8Value msg(isolate, message->Get());
       // (filename):(line) (message)
-      std::stringstream warning;
-      warning << *filename;
-      warning << ":";
-      warning << message->GetLineNumber(env->context()).FromMaybe(-1);
-      warning << " ";
-      v8::String::Utf8Value msg(isolate, message->Get());
-      warning << *msg;
-      USE(ProcessEmitWarningGeneric(env, warning.str().c_str(), "V8"));
+      std::string warning =
+          SPrintF("%s:%s %s",
+                  filename,
+                  message->GetLineNumber(env->context()).FromMaybe(-1),
+                  msg);
+      // Defer the warning to the next event loop iteration. This prevents
+      // crashes when V8 emits warnings during code evaluation with
+      // throwOnSideEffect.
+      env->SetImmediate([warning](Environment* env) {
+        ProcessEmitWarningGeneric(env, warning, "V8");
+      });
       break;
     }
     case Isolate::MessageErrorLevel::kMessageError:
       TriggerUncaughtException(isolate, error, message);
       break;
   }
+}
+
+void GetErrorSourcePositions(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  HandleScope scope(isolate);
+  Realm* realm = Realm::GetCurrent(args);
+  Local<Context> context = realm->context();
+
+  CHECK(args[0]->IsObject());
+
+  Local<Message> msg = Exception::CreateMessage(isolate, args[0]);
+
+  // Message::GetEndColumn may not reflect the actual end column in all cases.
+  // So only expose startColumn to JS land.
+  Local<v8::Name> names[] = {
+      OneByteString(isolate, "sourceLine"),
+      OneByteString(isolate, "scriptResourceName"),
+      OneByteString(isolate, "lineNumber"),
+      OneByteString(isolate, "startColumn"),
+  };
+
+  Local<String> source_line;
+  if (!msg->GetSourceLine(context).ToLocal(&source_line)) {
+    return;
+  }
+  int line_number;
+  if (!msg->GetLineNumber(context).To(&line_number)) {
+    return;
+  }
+
+  Local<Value> values[] = {
+      source_line,
+      msg->GetScriptOrigin().ResourceName(),
+      v8::Integer::New(isolate, line_number),
+      v8::Integer::New(isolate, msg->GetStartColumn()),
+  };
+  Local<Object> info =
+      Object::New(isolate, v8::Null(isolate), names, values, arraysize(names));
+
+  args.GetReturnValue().Set(info);
 }
 
 void SetPrepareStackTraceCallback(const FunctionCallbackInfo<Value>& args) {
@@ -1063,7 +1198,7 @@ static void TriggerUncaughtException(const FunctionCallbackInfo<Value>& args) {
   if (env != nullptr && env->abort_on_uncaught_exception()) {
     ReportFatalException(
         env, exception, message, EnhanceFatalException::kEnhance);
-    Abort();
+    ABORT();
   }
   bool from_promise = args[1]->IsTrue();
   errors::TriggerUncaughtException(isolate, exception, message, from_promise);
@@ -1077,6 +1212,7 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(SetEnhanceStackForFatalException);
   registry->Register(NoSideEffectsToString);
   registry->Register(TriggerUncaughtException);
+  registry->Register(GetErrorSourcePositions);
 }
 
 void Initialize(Local<Object> target,
@@ -1104,8 +1240,10 @@ void Initialize(Local<Object> target,
       context, target, "noSideEffectsToString", NoSideEffectsToString);
   SetMethod(
       context, target, "triggerUncaughtException", TriggerUncaughtException);
+  SetMethod(
+      context, target, "getErrorSourcePositions", GetErrorSourcePositions);
 
-  Isolate* isolate = context->GetIsolate();
+  Isolate* isolate = Isolate::GetCurrent();
   Local<Object> exit_codes = Object::New(isolate);
   READONLY_PROPERTY(target, "exitCodes", exit_codes);
 
@@ -1119,15 +1257,19 @@ void Initialize(Local<Object> target,
 
 void DecorateErrorStack(Environment* env,
                         const errors::TryCatchScope& try_catch) {
-  Local<Value> exception = try_catch.Exception();
+  DecorateErrorStack(env, try_catch.Exception(), try_catch.Message());
+}
 
+void DecorateErrorStack(Environment* env,
+                        Local<Value> exception,
+                        Local<Message> message) {
   if (!exception->IsObject()) return;
 
   Local<Object> err_obj = exception.As<Object>();
 
   if (IsExceptionDecorated(env, err_obj)) return;
 
-  AppendExceptionLine(env, exception, try_catch.Message(), CONTEXTIFY_ERROR);
+  AppendExceptionLine(env, exception, message, CONTEXTIFY_ERROR);
   TryCatchScope try_catch_scope(env);  // Ignore exceptions below.
   MaybeLocal<Value> stack = err_obj->Get(env->context(), env->stack_string());
   MaybeLocal<Value> maybe_value =
@@ -1165,6 +1307,26 @@ void TriggerUncaughtException(Isolate* isolate,
   CHECK(isolate->InContext());
   Local<Context> context = isolate->GetCurrentContext();
   Environment* env = Environment::GetCurrent(context);
+  // Re-entrancy guard: prevent infinite recursion when the JS-level
+  // exception handler (process._fatalException) itself triggers another
+  // exception through the inspector protocol, causing V8's pending message
+  // reporting to call TriggerUncaughtException reentrantly.
+  if (is_in_uncaught_exception) {
+    PrintToStderrAndFlush(
+        "FATAL ERROR: Re-entrant uncaught exception detected.\n"
+        "The exception handler threw an error while processing a\n"
+        "previous uncaught exception, likely due to an inspector\n"
+        "protocol issue. Aborting to prevent infinite recursion.\n" +
+        FormatCaughtException(isolate, context, error, message));
+    ABORT();
+  }
+  // RAII guard to ensure the flag is cleared when TriggerUncaughtException
+  // returns normally. Note: ABORT() and env->Exit() do not run this
+  // destructor, which is intentional — the process is terminating.
+  struct UncaughtExceptionGuard {
+    UncaughtExceptionGuard() { is_in_uncaught_exception = true; }
+    ~UncaughtExceptionGuard() { is_in_uncaught_exception = false; }
+  } uncaught_exception_guard;
   if (env == nullptr) {
     // This means that the exception happens before Environment is assigned
     // to the context e.g. when there is a SyntaxError in a per-context
@@ -1174,7 +1336,7 @@ void TriggerUncaughtException(Isolate* isolate,
     // much we can do, so we just print whatever is useful and crash.
     PrintToStderrAndFlush(
         FormatCaughtException(isolate, context, error, message));
-    Abort();
+    ABORT();
   }
 
   // Invoke process._fatalException() to give user a chance to handle it.
@@ -1182,9 +1344,12 @@ void TriggerUncaughtException(Isolate* isolate,
   // monkey-patchable.
   Local<Object> process_object = env->process_object();
   Local<String> fatal_exception_string = env->fatal_exception_string();
-  Local<Value> fatal_exception_function =
-      process_object->Get(env->context(),
-                          fatal_exception_string).ToLocalChecked();
+  Local<Value> fatal_exception_function;
+  if (!process_object->Get(env->context(), fatal_exception_string)
+           .ToLocal(&fatal_exception_function)) {
+    // V8 will have scheduled a superseding error to throw
+    return;
+  }
   // If the exception happens before process._fatalException is attached
   // during bootstrap, or if the user has patched it incorrectly, exit
   // the current Node.js instance.
@@ -1199,8 +1364,26 @@ void TriggerUncaughtException(Isolate* isolate,
   if (env->can_call_into_js()) {
     // We do not expect the global uncaught exception itself to throw any more
     // exceptions. If it does, exit the current Node.js instance.
-    errors::TryCatchScope try_catch(env,
-                                    errors::TryCatchScope::CatchMode::kFatal);
+    // Special case: if the original error was a stack overflow and calling
+    // _fatalException causes another stack overflow, rethrow it to allow
+    // user code's try-catch blocks to potentially catch it.
+    auto is_stack_overflow = [&] {
+      return IsStackOverflowError(env->isolate(), error);
+    };
+    // Without a JS stack, rethrowing may or may not do anything.
+    // TODO(addaleax): In V8, expose a way to check whether there is a JS stack
+    // or TryCatch that would capture the rethrown exception.
+    auto has_js_stack = [&] {
+      HandleScope handle_scope(env->isolate());
+      Local<StackTrace> stack;
+      return GetCurrentStackTrace(env->isolate(), 1).ToLocal(&stack) &&
+             stack->GetFrameCount() > 0;
+    };
+    errors::TryCatchScope::CatchMode mode =
+        is_stack_overflow() && has_js_stack()
+            ? errors::TryCatchScope::CatchMode::kFatalRethrowStackOverflow
+            : errors::TryCatchScope::CatchMode::kFatal;
+    errors::TryCatchScope try_catch(env, mode);
     // Explicitly disable verbose exception reporting -
     // if process._fatalException() throws an error, we don't want it to
     // trigger the per-isolate message listener which will call this

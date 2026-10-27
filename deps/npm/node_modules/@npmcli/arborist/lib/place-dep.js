@@ -8,8 +8,8 @@
 // a result.
 
 const localeCompare = require('@isaacs/string-locale-compare')('en')
-const log = require('proc-log')
-const { cleanUrl } = require('npm-registry-fetch')
+const { log } = require('proc-log')
+const { redact } = require('@npmcli/redact')
 const deepestNestingTarget = require('./deepest-nesting-target.js')
 const CanPlaceDep = require('./can-place-dep.js')
 const {
@@ -96,6 +96,7 @@ class PlaceDep {
         target,
         preferDedupe: this.preferDedupe,
         explicitRequest: this.explicitRequest,
+        auditReport: this.auditReport,
       })
       this.checks.set(target, cpd)
 
@@ -188,7 +189,7 @@ class PlaceDep {
       `${this.dep.name}@${this.dep.version}`,
       this.canPlace.description,
       `for: ${this.edge.from.package._id || this.edge.from.location}`,
-      `want: ${cleanUrl(this.edge.spec || '*')}`
+      `want: ${redact(this.edge.spec || '*')}`
     )
 
     const placementType = this.canPlace.canPlace === CONFLICT
@@ -203,7 +204,7 @@ class PlaceDep {
         this.warnPeerConflict()
       }
 
-      // if we get a KEEP in a update scenario, then we MAY have something
+      // if we get a KEEP in an update scenario, then we MAY have something
       // already duplicating this unnecessarily!  For example:
       // ```
       // root (dep: y@1)
@@ -247,6 +248,12 @@ class PlaceDep {
       installLinks: this.installLinks,
       legacyPeerDeps: this.legacyPeerDeps,
       error: this.dep.errors[0],
+      ...(this.dep.packageExtensionsApplied
+        ? { packageExtensionsApplied: this.dep.packageExtensionsApplied }
+        : {}),
+      ...(this.dep.npmExtensionApplied
+        ? { npmExtensionApplied: this.dep.npmExtensionApplied }
+        : {}),
       ...(this.dep.overrides ? { overrides: this.dep.overrides } : {}),
       ...(this.dep.isLink ? { target: this.dep.target, realpath: this.dep.realpath } : {}),
     })
@@ -317,7 +324,7 @@ class PlaceDep {
         force: this.force,
         installLinks: this.installLinks,
         installStrategy: this.installStrategy,
-        legacyPeerDeps: this.legaycPeerDeps,
+        legacyPeerDeps: this.legacyPeerDeps,
         preferDedupe: this.preferDedupe,
         strictPeerDeps: this.strictPeerDeps,
         updateNames: this.updateName,
@@ -421,9 +428,9 @@ class PlaceDep {
   // prune all the nodes in a branch of the tree that can be safely removed
   // This is only the most basic duplication detection; it finds if there
   // is another satisfying node further up the tree, and if so, dedupes.
-  // Even in installStategy is nested, we do this amount of deduplication.
+  // Even if installStrategy is nested, we do this amount of deduplication.
   pruneDedupable (node, descend = true) {
-    if (node.canDedupe(this.preferDedupe)) {
+    if (node.canDedupe(this.preferDedupe, this.explicitRequest)) {
       // gather up all deps that have no valid edges in from outside
       // the dep set, except for this node we're deduping, so that we
       // also prune deps that would be made extraneous.

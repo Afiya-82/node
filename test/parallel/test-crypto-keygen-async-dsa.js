@@ -4,16 +4,20 @@ const common = require('../common');
 if (!common.hasCrypto)
   common.skip('missing crypto');
 
-const assert = require('assert');
 const {
-  generateKeyPair,
-} = require('crypto');
-const {
+  isBoringSSL,
   assertApproximateSize,
   testSignVerify,
   spkiExp,
 } = require('../common/crypto');
 
+if (isBoringSSL)
+  common.skip('not supported by BoringSSL');
+
+const assert = require('assert');
+const {
+  generateKeyPair,
+} = require('crypto');
 // Test async DSA key generation.
 {
   const privateKeyEncoding = {
@@ -22,7 +26,7 @@ const {
   };
 
   generateKeyPair('dsa', {
-    modulusLength: common.hasOpenSSL3 ? 2048 : 512,
+    modulusLength: 2048,
     divisorLength: 256,
     publicKeyEncoding: {
       type: 'spki',
@@ -30,7 +34,7 @@ const {
     },
     privateKeyEncoding: {
       cipher: 'aes-128-cbc',
-      passphrase: 'secret',
+      passphrase: 'password',
       ...privateKeyEncoding
     }
   }, common.mustSucceed((publicKey, privateKeyDER) => {
@@ -39,8 +43,8 @@ const {
     // The private key is DER-encoded.
     assert(Buffer.isBuffer(privateKeyDER));
 
-    assertApproximateSize(publicKey, common.hasOpenSSL3 ? 1194 : 440);
-    assertApproximateSize(privateKeyDER, common.hasOpenSSL3 ? 721 : 336);
+    assertApproximateSize(publicKey, 1194);
+    assertApproximateSize(privateKeyDER, 721);
 
     // Since the private key is encrypted, signing shouldn't work anymore.
     assert.throws(() => {
@@ -58,7 +62,7 @@ const {
     testSignVerify(publicKey, {
       key: privateKeyDER,
       ...privateKeyEncoding,
-      passphrase: 'secret'
+      passphrase: 'password'
     });
   }));
 }

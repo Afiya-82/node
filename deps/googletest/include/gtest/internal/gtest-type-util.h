@@ -47,8 +47,6 @@
 // libstdc++ (which is where cxxabi.h comes from).
 #if GTEST_HAS_CXXABI_H_
 #include <cxxabi.h>
-#elif defined(__HP_aCC)
-#include <acxx_demangle.h>
 #endif  // GTEST_HASH_CXXABI_H_
 
 namespace testing {
@@ -71,7 +69,7 @@ inline std::string CanonicalizeForStdLibVersioning(std::string s) {
   // Strip redundant spaces in typename to match MSVC
   // For example, std::pair<int, bool> -> std::pair<int,bool>
   static const char to_search[] = ", ";
-  static const char replace_str[] = ",";
+  const char replace_char = ',';
   size_t pos = 0;
   while (true) {
     // Get the next occurrence from the current position
@@ -80,8 +78,8 @@ inline std::string CanonicalizeForStdLibVersioning(std::string s) {
       break;
     }
     // Replace this occurrence of substring
-    s.replace(pos, strlen(to_search), replace_str);
-    pos += strlen(replace_str);
+    s.replace(pos, strlen(to_search), 1, replace_char);
+    ++pos;
   }
   return s;
 }
@@ -90,13 +88,11 @@ inline std::string CanonicalizeForStdLibVersioning(std::string s) {
 // GetTypeName(const std::type_info&) returns a human-readable name of type T.
 inline std::string GetTypeName(const std::type_info& type) {
   const char* const name = type.name();
-#if GTEST_HAS_CXXABI_H_ || defined(__HP_aCC)
+#if GTEST_HAS_CXXABI_H_
   int status = 0;
   // gcc's implementation of typeid(T).name() mangles the type name,
   // so we have to demangle it.
-#if GTEST_HAS_CXXABI_H_
   using abi::__cxa_demangle;
-#endif  // GTEST_HAS_CXXABI_H_
   char* const readable_name = __cxa_demangle(name, nullptr, nullptr, &status);
   const std::string name_str(status == 0 ? readable_name : name);
   free(readable_name);
@@ -117,7 +113,7 @@ inline std::string GetTypeName(const std::type_info& type) {
   return s;
 #else
   return name;
-#endif  // GTEST_HAS_CXXABI_H_ || __HP_aCC
+#endif  // GTEST_HAS_CXXABI_H_
 }
 #endif  // GTEST_HAS_RTTI
 

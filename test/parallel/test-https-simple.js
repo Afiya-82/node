@@ -26,6 +26,8 @@ const fixtures = require('../common/fixtures');
 if (!common.hasCrypto)
   common.skip('missing crypto');
 
+const { untrustedLeafErrorCode } = require('../common/tls');
+
 const assert = require('assert');
 const https = require('https');
 
@@ -45,13 +47,13 @@ const serverCallback = common.mustCall(function(req, res) {
 });
 
 const invalid_options = [ 'foo', 42, true, [] ];
-invalid_options.forEach((option) => {
+for (const option of invalid_options) {
   assert.throws(() => {
     new https.Server(option);
   }, {
     code: 'ERR_INVALID_ARG_TYPE',
   });
-});
+}
 
 const server = https.createServer(options, serverCallback);
 
@@ -93,7 +95,7 @@ server.listen(0, common.mustCall(() => {
   const checkCertReq = https.request(options, common.mustNotCall()).end();
 
   checkCertReq.on('error', common.mustCall((e) => {
-    assert.strictEqual(e.code, 'UNABLE_TO_VERIFY_LEAF_SIGNATURE');
+    assert.strictEqual(e.code, untrustedLeafErrorCode);
     done();
   }));
 }));

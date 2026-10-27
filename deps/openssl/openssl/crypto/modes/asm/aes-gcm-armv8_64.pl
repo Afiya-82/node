@@ -1,5 +1,5 @@
 #! /usr/bin/env perl
-# Copyright 2019-2023 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 2019-2026 The OpenSSL Project Authors. All Rights Reserved.
 #
 # Licensed under the Apache License 2.0 (the "License").  You may not use
 # this file except in compliance with the License.  You can obtain a copy
@@ -12,7 +12,7 @@
 # derived from https://github.com/ARM-software/AArch64cryptolib, original
 # author Samuel Lee <Samuel.Lee@arm.com>. The module is, however, dual
 # licensed under OpenSSL and CRYPTOGAMS licenses depending on where you
-# obtain it. For further details see http://www.openssl.org/~appro/cryptogams/.
+# obtain it. For further details see https://github.com/dot-asm/cryptogams/.
 #========================================================================
 #
 # Approach - assume we don't want to reload constants, so reserve ~half of vector register file for constants
@@ -225,7 +225,7 @@ my $rk4v="v22";
 my $rk4d="d22";
 
 $code=<<___;
-#include "arm_arch.h"
+#include "arch/arm_arch.h"
 
 #if __ARM_MAX_ARCH__>=8
 ___
@@ -245,18 +245,19 @@ $code.=<<___                    if ($flavour !~ /64/);
 ___
 
 #########################################################################################
-# size_t aes_gcm_enc_128_kernel(const unsigned char *in,
-#                               size_t len,
-#                               unsigned char *out,
-#                               const void *key,
+# size_t aes_gcm_enc_128_kernel(const uint8_t * plaintext,
+#                               uint64_t plaintext_length,
+#                               uint8_t * ciphertext,
+#                               uint64_t *Xi,
 #                               unsigned char ivec[16],
-#                               u64 *Xi);
+#                               const void *key);
 #
 $code.=<<___;
 .global aes_gcm_enc_128_kernel
 .type   aes_gcm_enc_128_kernel,%function
 .align  4
 aes_gcm_enc_128_kernel:
+	AARCH64_VALID_CALL_TARGET
 	cbz     x1, .L128_enc_ret
 	stp     x19, x20, [sp, #-112]!
 	mov     x16, x4
@@ -1130,18 +1131,19 @@ aes_gcm_enc_128_kernel:
 ___
 
 #########################################################################################
-# size_t aes_gcm_dec_128_kernel(const unsigned char *in,
-#                               size_t len,
-#                               unsigned char *out,
-#                               const void *key,
+# size_t aes_gcm_dec_128_kernel(const uint8_t * ciphertext,
+#                               uint64_t plaintext_length,
+#                               uint8_t * plaintext,
+#                               uint64_t *Xi,
 #                               unsigned char ivec[16],
-#                               u64 *Xi);
+#                               const void *key);
 #
 $code.=<<___;
 .global aes_gcm_dec_128_kernel
 .type   aes_gcm_dec_128_kernel,%function
 .align  4
 aes_gcm_dec_128_kernel:
+	AARCH64_VALID_CALL_TARGET
 	cbz     x1, .L128_dec_ret
 	stp     x19, x20, [sp, #-112]!
 	mov     x16, x4
@@ -2087,18 +2089,19 @@ my $rk4v="v22";
 my $rk4d="d22";
 
 #########################################################################################
-# size_t aes_gcm_enc_192_kernel(const unsigned char *in,
-#                               size_t len,
-#                               unsigned char *out,
-#                               const void *key,
+# size_t aes_gcm_enc_192_kernel(const uint8_t * plaintext,
+#                               uint64_t plaintext_length,
+#                               uint8_t * ciphertext,
+#                               uint64_t *Xi,
 #                               unsigned char ivec[16],
-#                               u64 *Xi);
+#                               const void *key);
 #
 $code.=<<___;
 .global aes_gcm_enc_192_kernel
 .type   aes_gcm_enc_192_kernel,%function
 .align  4
 aes_gcm_enc_192_kernel:
+	AARCH64_VALID_CALL_TARGET
 	cbz     x1, .L192_enc_ret
 	stp     x19, x20, [sp, #-112]!
 	mov     x16, x4
@@ -3023,18 +3026,19 @@ aes_gcm_enc_192_kernel:
 ___
 
 #########################################################################################
-# size_t aes_gcm_dec_192_kernel(const unsigned char *in,
-#                               size_t len,
-#                               unsigned char *out,
-#                               const void *key,
+# size_t aes_gcm_dec_192_kernel(const uint8_t * ciphertext,
+#                               uint64_t plaintext_length,
+#                               uint8_t * plaintext,
+#                               uint64_t *Xi,
 #                               unsigned char ivec[16],
-#                               u64 *Xi);
+#                               const void *key);
 #
 $code.=<<___;
 .global aes_gcm_dec_192_kernel
 .type   aes_gcm_dec_192_kernel,%function
 .align  4
 aes_gcm_dec_192_kernel:
+	AARCH64_VALID_CALL_TARGET
 	cbz     x1, .L192_dec_ret
 	stp     x19, x20, [sp, #-112]!
 	mov     x16, x4
@@ -4030,18 +4034,19 @@ my $rk4v="v22";
 my $rk4d="d22";
 
 #########################################################################################
-# size_t aes_gcm_enc_256_kernel(const unsigned char *in,
-#                               size_t len,
-#                               unsigned char *out,
-#                               const void *key,
+# size_t aes_gcm_enc_256_kernel(const uint8_t * plaintext,
+#                               uint64_t plaintext_length,
+#                               uint8_t * ciphertext,
+#                               uint64_t *Xi,
 #                               unsigned char ivec[16],
-#                               u64 *Xi);
+#                               const void *key);
 #
 $code.=<<___;
 .global aes_gcm_enc_256_kernel
 .type   aes_gcm_enc_256_kernel,%function
 .align  4
 aes_gcm_enc_256_kernel:
+	AARCH64_VALID_CALL_TARGET
 	cbz     x1, .L256_enc_ret
 	stp     x19, x20, [sp, #-112]!
 	mov     x16, x4
@@ -5014,18 +5019,19 @@ my $t8d="d4";
 my $t9="v6";
 my $t9d="d6";
 #########################################################################################
-# size_t aes_gcm_dec_256_kernel(const unsigned char *in,
-#                               size_t len,
-#                               unsigned char *out,
-#                               const void *key,
+# size_t aes_gcm_dec_256_kernel(const uint8_t * ciphertext,
+#                               uint64_t plaintext_length,
+#                               uint8_t * plaintext,
+#                               uint64_t *Xi,
 #                               unsigned char ivec[16],
-#                               u64 *Xi);
+#                               const void *key);
 #
 $code.=<<___;
 .global aes_gcm_dec_256_kernel
 .type   aes_gcm_dec_256_kernel,%function
 .align  4
 aes_gcm_dec_256_kernel:
+	AARCH64_VALID_CALL_TARGET
 	cbz     x1, .L256_dec_ret
 	stp     x19, x20, [sp, #-112]!
 	mov     x16, x4
@@ -6029,7 +6035,8 @@ ___
 }
 
 $code.=<<___;
-.asciz  "GHASH for ARMv8, CRYPTOGAMS by <appro\@openssl.org>"
+.rodata
+.asciz  "GHASH for ARMv8, CRYPTOGAMS by <https://github.com/dot-asm>"
 .align  2
 #endif
 ___

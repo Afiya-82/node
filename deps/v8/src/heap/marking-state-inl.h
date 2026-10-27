@@ -5,17 +5,24 @@
 #ifndef V8_HEAP_MARKING_STATE_INL_H_
 #define V8_HEAP_MARKING_STATE_INL_H_
 
-#include "src/heap/marking-inl.h"
 #include "src/heap/marking-state.h"
-#include "src/heap/memory-chunk.h"
+// Include the non-inl header before the rest of the headers.
+
+#include "src/heap/marking-inl.h"
+#include "src/heap/mutable-page-inl.h"
 
 namespace v8 {
 namespace internal {
 
 template <typename ConcreteState, AccessMode access_mode>
+MarkingStateBase<ConcreteState, access_mode>::MarkingStateBase(
+    const Isolate* isolate)
+    : isolate_(isolate) {}
+
+template <typename ConcreteState, AccessMode access_mode>
 bool MarkingStateBase<ConcreteState, access_mode>::IsMarked(
     const Tagged<HeapObject> obj) const {
-  return MarkBit::From(obj).template Get<access_mode>();
+  return MarkBit::From(isolate_, obj).template Get<access_mode>();
 }
 
 template <typename ConcreteState, AccessMode access_mode>
@@ -27,15 +34,27 @@ bool MarkingStateBase<ConcreteState, access_mode>::IsUnmarked(
 template <typename ConcreteState, AccessMode access_mode>
 bool MarkingStateBase<ConcreteState, access_mode>::TryMark(
     Tagged<HeapObject> obj) {
-  return MarkBit::From(obj).template Set<access_mode>();
+  return MarkBit::From(isolate_, obj).template Set<access_mode>();
 }
 
 template <typename ConcreteState, AccessMode access_mode>
 bool MarkingStateBase<ConcreteState, access_mode>::TryMarkAndAccountLiveBytes(
     Tagged<HeapObject> obj) {
   if (TryMark(obj)) {
-    MemoryChunk::FromHeapObject(obj)->IncrementLiveBytesAtomically(
-        ALIGN_TO_ALLOCATION_ALIGNMENT(obj->Size(cage_base())));
+    MutablePage::FromHeapObject(isolate_, obj)
+        ->IncrementLiveBytesAtomically(
+            ALIGN_TO_ALLOCATION_ALIGNMENT(obj->SafeSize().value()));
+    return true;
+  }
+  return false;
+}
+
+template <typename ConcreteState, AccessMode access_mode>
+bool MarkingStateBase<ConcreteState, access_mode>::TryMarkAndAccountLiveBytes(
+    Tagged<HeapObject> obj, uint32_t object_size) {
+  if (TryMark(obj)) {
+    MutablePage::FromHeapObject(isolate_, obj)
+        ->IncrementLiveBytesAtomically(object_size);
     return true;
   }
   return false;

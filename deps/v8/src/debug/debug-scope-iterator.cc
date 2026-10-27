@@ -12,15 +12,15 @@ namespace v8 {
 
 std::unique_ptr<debug::ScopeIterator> debug::ScopeIterator::CreateForFunction(
     v8::Isolate* v8_isolate, v8::Local<v8::Function> v8_func) {
-  internal::Handle<internal::JSReceiver> receiver = Utils::OpenHandle(*v8_func);
+  internal::DirectHandle<internal::JSReceiver> receiver =
+      Utils::OpenDirectHandle(*v8_func);
 
   // Besides JSFunction and JSBoundFunction, {v8_func} could be an
   // ObjectTemplate with a CallAsFunctionHandler. We only handle plain
   // JSFunctions.
   if (!IsJSFunction(*receiver)) return nullptr;
 
-  internal::Handle<internal::JSFunction> function =
-      internal::Handle<internal::JSFunction>::cast(receiver);
+  auto function = internal::Cast<internal::JSFunction>(receiver);
 
   CHECK(function->has_context());
   return std::unique_ptr<debug::ScopeIterator>(new internal::DebugScopeIterator(
@@ -35,29 +35,27 @@ debug::ScopeIterator::CreateForGeneratorObject(
   DCHECK(IsJSGeneratorObject(*generator));
   return std::unique_ptr<debug::ScopeIterator>(new internal::DebugScopeIterator(
       reinterpret_cast<internal::Isolate*>(v8_isolate),
-      internal::Handle<internal::JSGeneratorObject>::cast(generator)));
+      internal::Cast<internal::JSGeneratorObject>(generator)));
 }
 
 namespace internal {
 
 DebugScopeIterator::DebugScopeIterator(Isolate* isolate,
                                        FrameInspector* frame_inspector)
-    : iterator_(
-          isolate, frame_inspector,
-          ::v8::internal::ScopeIterator::ReparseStrategy::kFunctionLiteral) {
-  if (!Done() && ShouldIgnore()) Advance();
+    : iterator_(isolate, frame_inspector) {
+  iterator_.AdvanceToScopeNumber(0);
 }
 
 DebugScopeIterator::DebugScopeIterator(Isolate* isolate,
-                                       Handle<JSFunction> function)
+                                       DirectHandle<JSFunction> function)
     : iterator_(isolate, function) {
-  if (!Done() && ShouldIgnore()) Advance();
+  iterator_.AdvanceToScopeNumber(0);
 }
 
 DebugScopeIterator::DebugScopeIterator(Isolate* isolate,
                                        Handle<JSGeneratorObject> generator)
     : iterator_(isolate, generator) {
-  if (!Done() && ShouldIgnore()) Advance();
+  iterator_.AdvanceToScopeNumber(0);
 }
 
 bool DebugScopeIterator::Done() { return iterator_.Done(); }
@@ -65,14 +63,7 @@ bool DebugScopeIterator::Done() { return iterator_.Done(); }
 void DebugScopeIterator::Advance() {
   DCHECK(!Done());
   iterator_.Next();
-  while (!Done() && ShouldIgnore()) {
-    iterator_.Next();
-  }
-}
-
-bool DebugScopeIterator::ShouldIgnore() {
-  if (GetType() == debug::ScopeIterator::ScopeTypeLocal) return false;
-  return !iterator_.DeclaresLocals(i::ScopeIterator::Mode::ALL);
+  iterator_.AdvanceToScopeNumber(0);
 }
 
 v8::debug::ScopeIterator::ScopeType DebugScopeIterator::GetType() {
@@ -82,7 +73,8 @@ v8::debug::ScopeIterator::ScopeType DebugScopeIterator::GetType() {
 
 v8::Local<v8::Object> DebugScopeIterator::GetObject() {
   DCHECK(!Done());
-  Handle<JSObject> value = iterator_.ScopeObject(i::ScopeIterator::Mode::ALL);
+  DirectHandle<JSObject> value =
+      iterator_.ScopeObject(i::ScopeIterator::Mode::ALL);
   return Utils::ToLocal(value);
 }
 
@@ -93,7 +85,7 @@ int DebugScopeIterator::GetScriptId() {
 
 v8::Local<v8::Value> DebugScopeIterator::GetFunctionDebugName() {
   DCHECK(!Done());
-  Handle<Object> name = iterator_.GetFunctionDebugName();
+  DirectHandle<Object> name = iterator_.GetFunctionDebugName();
   return Utils::ToLocal(name);
 }
 
@@ -113,11 +105,16 @@ debug::Location DebugScopeIterator::GetEndLocation() {
       ->GetSourceLocation(iterator_.end_position());
 }
 
+bool DebugScopeIterator::DeclaresLocals() {
+  DCHECK(!Done());
+  return iterator_.DeclaresLocals(i::ScopeIterator::Mode::ALL);
+}
+
 bool DebugScopeIterator::SetVariableValue(v8::Local<v8::String> name,
                                           v8::Local<v8::Value> value) {
   DCHECK(!Done());
   return iterator_.SetVariableValue(Utils::OpenHandle(*name),
-                                    Utils::OpenHandle(*value));
+                                    Utils::OpenDirectHandle(*value));
 }
 
 }  // namespace internal

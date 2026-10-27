@@ -62,7 +62,8 @@ void BranchElimination::SimplifyBranchCondition(Node* branch) {
   // use the same branch condition. In such case, create a new phi with constant
   // inputs and let the second branch use the phi as its branch condition. From
   // this transformation, more branch folding opportunities would be exposed to
-  // later passes through branch cloning in effect-control-linearizer.
+  // later passes through branch cloning in Turboshaft's
+  // BranchEliminationReducer.
   //
   // condition                             condition
   //    |   \                                   |
@@ -102,7 +103,7 @@ void BranchElimination::SimplifyBranchCondition(Node* branch) {
 
   Node* condition = branch->InputAt(0);
   BranchSemantics semantics = SemanticsOf(branch);
-  Graph* graph = jsgraph()->graph();
+  TFGraph* graph = jsgraph()->graph();
   base::SmallVector<Node*, 2> phi_inputs;
 
   Node::Inputs inputs = merge->inputs();
@@ -387,7 +388,7 @@ Reduction BranchElimination::ReduceOtherControl(Node* node) {
   return TakeStatesFromFirstControl(node);
 }
 
-Graph* BranchElimination::graph() const { return jsgraph()->graph(); }
+TFGraph* BranchElimination::graph() const { return jsgraph()->graph(); }
 
 Isolate* BranchElimination::isolate() const { return jsgraph()->isolate(); }
 

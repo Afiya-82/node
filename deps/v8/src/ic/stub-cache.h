@@ -36,7 +36,7 @@ class V8_EXPORT_PRIVATE StubCache {
     // string.
     StrongTaggedValue key;
     // {value} is a tagged heap object reference (weak or strong), equivalent
-    // to a MaybeObject's payload.
+    // to a Tagged<MaybeObject>'s payload.
     TaggedValue value;
     // {map} is a tagged Map pointer, may be cleared by setting to Smi::zero().
     StrongTaggedValue map;
@@ -44,8 +44,8 @@ class V8_EXPORT_PRIVATE StubCache {
 
   void Initialize();
   // Access cache for entry hash(name, map).
-  void Set(Tagged<Name> name, Tagged<Map> map, MaybeObject handler);
-  MaybeObject Get(Tagged<Name> name, Tagged<Map> map);
+  void Set(Tagged<Name> name, Tagged<Map> map, Tagged<MaybeObject> handler);
+  Tagged<MaybeObject> Get(Tagged<Name> name, Tagged<Map> map);
   // Clear the lookup table (@ mark compact collection).
   void Clear();
 
@@ -85,9 +85,9 @@ class V8_EXPORT_PRIVATE StubCache {
   // the static_assert below, in {entry(...)}).
   static const int kCacheIndexShift = Name::HashBits::kShift;
 
-  static const int kPrimaryTableBits = 11;
+  static const int kPrimaryTableBits = 12;
   static const int kPrimaryTableSize = (1 << kPrimaryTableBits);
-  static const int kSecondaryTableBits = 9;
+  static const int kSecondaryTableBits = 10;
   static const int kSecondaryTableSize = (1 << kSecondaryTableBits);
 
   static int PrimaryOffsetForTesting(Tagged<Name> name, Tagged<Map> map);

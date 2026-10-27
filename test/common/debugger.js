@@ -7,11 +7,10 @@ const BREAK_MESSAGE = new RegExp('(?:' + [
   'exception', 'other', 'promiseRejection', 'step',
 ].join('|') + ') in', 'i');
 
-let TIMEOUT = common.platformTimeout(5000);
-if (common.isWindows) {
-  // Some of the windows machines in the CI need more time to receive
-  // the outputs from the client.
-  // https://github.com/nodejs/build/issues/3014
+let TIMEOUT = common.platformTimeout(10000);
+// Some macOS and Windows machines require more time to receive the outputs from the client.
+// https://github.com/nodejs/build/issues/3014
+if (common.isWindows || common.isMacOS) {
   TIMEOUT = common.platformTimeout(15000);
 }
 
@@ -19,10 +18,16 @@ function isPreBreak(output) {
   return /Break on start/.test(output) && /1 \(function \(exports/.test(output);
 }
 
-function startCLI(args, flags = [], spawnOpts = {}) {
+function startCLI(args, flags = [], spawnOpts = {}, opts = { randomPort: true }) {
   let stderrOutput = '';
-  const child =
-    spawn(process.execPath, [...flags, 'inspect', ...args], spawnOpts);
+  const child = spawn(process.execPath, [
+    ...flags,
+    'inspect',
+    ...(opts.randomPort !== false ? ['--port=0'] : []),
+    ...args,
+  ], spawnOpts);
+
+  const closed = new Promise((resolve) => child.once('close', resolve));
 
   const outputBuffer = [];
   function bufferOutput(chunk) {
@@ -85,12 +90,12 @@ function startCLI(args, flags = [], spawnOpts = {}) {
           reject(new Error(message));
         }
 
+        // Capture stack trace here to show where waitFor was called from when it times out.
+        const timeoutErr = new Error(`Timeout (${TIMEOUT}) while waiting for ${pattern}`);
         const timer = setTimeout(() => {
           tearDown();
-          reject(new Error([
-            `Timeout (${TIMEOUT}) while waiting for ${pattern}`,
-            `found: ${this.output}`,
-          ].join('; ')));
+          timeoutErr.output = this.output;
+          reject(timeoutErr);
         }, TIMEOUT);
 
         function tearDown() {
@@ -138,6 +143,10 @@ function startCLI(args, flags = [], spawnOpts = {}) {
       return getOutput();
     },
 
+    get stderrOutput() {
+      return stderrOutput;
+    },
+
     get rawOutput() {
       return outputBuffer.join('').toString();
     },
@@ -173,10 +182,8 @@ function startCLI(args, flags = [], spawnOpts = {}) {
     },
 
     quit() {
-      return new Promise((resolve) => {
-        child.stdin.end();
-        child.on('close', resolve);
-      });
+      child.stdin.end();
+      return closed;
     },
   };
 }

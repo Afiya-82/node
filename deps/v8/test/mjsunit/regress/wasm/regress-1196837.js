@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --wasm-staging
-
 d8.file.execute('test/mjsunit/wasm/wasm-module-builder.js');
 
 const builder = new WasmModuleBuilder();
@@ -17,19 +15,19 @@ kExprLocalGet, 0x01,
 kExprLocalGet, 0x01,
 kExprLocalGet, 0x01,
 kExprLocalGet, 0x01,
-kAtomicPrefix, kExprI32AtomicCompareExchange16U, 0x00, 0x7a,
+kAtomicPrefix, kExprI32AtomicCompareExchange16U, 0x01, 0x7a,
 kExprLocalGet, 0x01,
 kExprLocalGet, 0x01,
 kExprLocalGet, 0x01,
 kExprLocalGet, 0x00,
 kExprMemoryGrow, 0x00,
-kAtomicPrefix, kExprI32AtomicCompareExchange16U, 0x00, 0x7a,
+kAtomicPrefix, kExprI32AtomicCompareExchange16U, 0x01, 0x7a,
 kExprLocalGet, 0x01,
 kExprLocalGet, 0x00,
-kAtomicPrefix, kExprI32AtomicCompareExchange16U, 0x00, 0x7a,
+kAtomicPrefix, kExprI32AtomicCompareExchange16U, 0x01, 0x7a,
 kExprLocalGet, 0x01,
 kExprLocalGet, 0x00,
-kAtomicPrefix, kExprI32AtomicCompareExchange16U, 0x00, 0x7a,
+kAtomicPrefix, kExprI32AtomicCompareExchange16U, 0x01, 0x7a,
 kExprLocalGet, 0x01,
 kExprReturnCall, 0x00,
 kExprEnd,

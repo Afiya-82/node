@@ -37,10 +37,10 @@ void CheckRegisterConfiguration(int count, const Register* registers,
 #endif
 
 void CallInterfaceDescriptorData::InitializeRegisters(
-    Flags flags, int return_count, int parameter_count,
-    StackArgumentOrder stack_order, int register_parameter_count,
-    const Register* registers, const DoubleRegister* double_registers,
-    const Register* return_registers,
+    Flags flags, CodeEntrypointTag tag, CodeSandboxingMode sandboxing_mode,
+    int return_count, int parameter_count, StackArgumentOrder stack_order,
+    int register_parameter_count, const Register* registers,
+    const DoubleRegister* double_registers, const Register* return_registers,
     const DoubleRegister* return_double_registers) {
   DCHECK(!IsInitializedTypes());
 
@@ -52,12 +52,14 @@ void CallInterfaceDescriptorData::InitializeRegisters(
 #endif
 
   flags_ = flags;
+  tag_ = tag;
+  sandboxing_mode_ = sandboxing_mode;
   stack_order_ = stack_order;
   return_count_ = return_count;
   param_count_ = parameter_count;
   register_param_count_ = register_parameter_count;
 
-  // The caller owns the the registers array, so we just set the pointer.
+  // The caller owns the registers array, so we just set the pointer.
   register_params_ = registers;
   double_register_params_ = double_registers;
   register_returns_ = return_registers;
@@ -172,6 +174,11 @@ void WriteBarrierDescriptor::Verify(CallInterfaceDescriptorData* data) {
   DCHECK(allocatable_regs.has(kContextRegister));
   DCHECK(allocatable_regs.has(kReturnRegister0));
   VerifyArgumentRegisterCount(data, 4);
+}
+// static
+void IndirectPointerWriteBarrierDescriptor::Verify(
+    CallInterfaceDescriptorData* data) {
+  WriteBarrierDescriptor::Verify(data);
 }
 #endif  // DEBUG
 

@@ -10,16 +10,19 @@ const {
 } = require('crypto');
 const {
   assertApproximateSize,
+  hasFIPS,
   testEncryptDecrypt,
   testSignVerify,
   pkcs1EncExp,
+  isBoringSSL,
 } = require('../common/crypto');
 
 // Test async RSA key generation with an encrypted private key.
 {
+  const isFips = hasFIPS(3);
   generateKeyPair('rsa', {
     publicExponent: 0x10001,
-    modulusLength: 512,
+    modulusLength: isFips ? 2048 : 512,
     publicKeyEncoding: {
       type: 'pkcs1',
       format: 'der'
@@ -30,7 +33,12 @@ const {
       cipher: 'aes-256-cbc',
       passphrase: 'secret'
     }
-  }, common.mustSucceed((publicKeyDER, privateKey) => {
+  }, common.mustCall((err, publicKeyDER, privateKey) => {
+    if (isFips) {
+      assert.strictEqual(err?.code, 'ERR_OSSL_EVP_UNSUPPORTED');
+      return;
+    }
+    assert.ifError(err);
     assert(Buffer.isBuffer(publicKeyDER));
     assertApproximateSize(publicKeyDER, 74);
 
@@ -43,14 +51,14 @@ const {
       type: 'pkcs1',
       format: 'der',
     };
-    const expectedError = common.hasOpenSSL3 ? {
-      name: 'Error',
-      message: 'error:07880109:common libcrypto routines::interrupted or ' +
-               'cancelled'
-    } : {
+    const expectedError = isBoringSSL ? {
       name: 'TypeError',
       code: 'ERR_MISSING_PASSPHRASE',
       message: 'Passphrase required for encrypted key'
+    } : {
+      name: 'Error',
+      message: 'error:07880109:common libcrypto routines::interrupted or ' +
+               'cancelled'
     };
     assert.throws(() => testSignVerify(publicKey, privateKey), expectedError);
 

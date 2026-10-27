@@ -23,8 +23,7 @@ namespace node {
 
 class Blob : public BaseObject {
  public:
-  static void RegisterExternalReferences(
-      ExternalReferenceRegistry* registry);
+  static void RegisterExternalReferences(ExternalReferenceRegistry* registry);
 
   static void CreatePerIsolateProperties(IsolateData* isolate_data,
                                          v8::Local<v8::ObjectTemplate> target);
@@ -52,9 +51,9 @@ class Blob : public BaseObject {
   SET_MEMORY_INFO_NAME(Blob)
   SET_SELF_SIZE(Blob)
 
-  BaseObjectPtr<Blob> Slice(Environment* env, size_t start, size_t end);
+  BaseObjectPtr<Blob> Slice(Environment* env, uint64_t start, uint64_t end);
 
-  inline size_t length() const { return this->data_queue_->size().value(); }
+  inline uint64_t length() const { return this->data_queue_->size().value(); }
 
   class BlobTransferData : public worker::TransferData {
    public:
@@ -82,6 +81,8 @@ class Blob : public BaseObject {
     static BaseObjectPtr<Reader> Create(Environment* env,
                                         BaseObjectPtr<Blob> blob);
     static void Pull(const v8::FunctionCallbackInfo<v8::Value>& args);
+    static void SetWakeup(const v8::FunctionCallbackInfo<v8::Value>& args);
+    void NotifyPull();
 
     explicit Reader(Environment* env,
                     v8::Local<v8::Object> obj,
@@ -95,6 +96,8 @@ class Blob : public BaseObject {
     std::shared_ptr<DataQueue::Reader> inner_;
     BaseObjectPtr<Blob> strong_ptr_;
     bool eos_ = false;
+    bool pull_pending_ = false;
+    v8::Global<v8::Function> wakeup_;
   };
 
   BaseObject::TransferMode GetTransferMode() const override;
@@ -126,24 +129,22 @@ class BlobBindingData : public SnapshotableObject {
 
   struct StoredDataObject : public MemoryRetainer {
     BaseObjectPtr<Blob> blob;
-    size_t length;
+    uint64_t length;
     std::string type;
 
     StoredDataObject() = default;
 
-    StoredDataObject(
-        const BaseObjectPtr<Blob>& blob_,
-        size_t length_,
-        const std::string& type_);
+    StoredDataObject(const BaseObjectPtr<Blob>& blob_,
+                     uint64_t length_,
+                     const std::string& type_);
 
     void MemoryInfo(MemoryTracker* tracker) const override;
     SET_SELF_SIZE(StoredDataObject)
     SET_MEMORY_INFO_NAME(StoredDataObject)
   };
 
-  void store_data_object(
-      const std::string& uuid,
-      const StoredDataObject& object);
+  void store_data_object(const std::string& uuid,
+                         const StoredDataObject& object);
 
   void revoke_data_object(const std::string& uuid);
 

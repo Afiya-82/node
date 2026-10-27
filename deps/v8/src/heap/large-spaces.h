@@ -16,7 +16,7 @@
 #include "src/heap/heap-verifier.h"
 #include "src/heap/heap.h"
 #include "src/heap/large-page.h"
-#include "src/heap/memory-chunk.h"
+#include "src/heap/mutable-page.h"
 #include "src/heap/spaces.h"
 #include "src/objects/heap-object.h"
 
@@ -81,6 +81,9 @@ class V8_EXPORT_PRIVATE LargeObjectSpace : public Space {
 
   std::unique_ptr<ObjectIterator> GetObjectIterator(Heap* heap) override;
 
+  void AddAllocationObserver(AllocationObserver* observer);
+  void RemoveAllocationObserver(AllocationObserver* observer);
+
 #ifdef VERIFY_HEAP
   void Verify(Isolate* isolate, SpaceVerificationVisitor* visitor) const final;
 #endif
@@ -89,19 +92,8 @@ class V8_EXPORT_PRIVATE LargeObjectSpace : public Space {
   void Print() override;
 #endif
 
-  // The last allocated object that is not guaranteed to be initialized when the
-  // concurrent marker visits it.
-  Address pending_object() const {
-    return pending_object_.load(std::memory_order_acquire);
-  }
 
-  void ResetPendingObject() {
-    pending_object_.store(0, std::memory_order_release);
-  }
-
-  base::SharedMutex* pending_allocation_mutex() {
-    return &pending_allocation_mutex_;
-  }
+  void UpdateAccountingAfterResizingObject(size_t old_size, size_t new_size);
 
   void set_objects_size(size_t objects_size) { objects_size_ = objects_size; }
 
@@ -110,9 +102,9 @@ class V8_EXPORT_PRIVATE LargeObjectSpace : public Space {
 
   void AdvanceAndInvokeAllocationObservers(Address soon_object, size_t size);
 
-  LargePage* AllocateLargePage(int object_size, Executability executable);
+  LargePage* AllocateLargePage(int object_size, Executability executable,
+                               AllocationHint hint);
 
-  void UpdatePendingObject(Tagged<HeapObject> object);
 
   std::atomic<size_t> size_;  // allocated bytes
   int page_count_;       // number of chunks
@@ -123,12 +115,6 @@ class V8_EXPORT_PRIVATE LargeObjectSpace : public Space {
   // trying to lock the mutex for a second time.
   base::RecursiveMutex allocation_mutex_;
 
-  // Current potentially uninitialized object. Protected by
-  // pending_allocation_mutex_.
-  std::atomic<Address> pending_object_;
-
-  // Used to protect pending_object_.
-  base::SharedMutex pending_allocation_mutex_;
 
   AllocationCounter allocation_counter_;
 
@@ -138,30 +124,36 @@ class V8_EXPORT_PRIVATE LargeObjectSpace : public Space {
 
 class OldLargeObjectSpace : public LargeObjectSpace {
  public:
-  explicit OldLargeObjectSpace(Heap* heap);
+  V8_EXPORT_PRIVATE explicit OldLargeObjectSpace(Heap* heap);
 
   V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT AllocationResult
-  AllocateRaw(int object_size);
-
-  V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT AllocationResult
-  AllocateRawBackground(LocalHeap* local_heap, int object_size);
+  AllocateRaw(LocalHeap* local_heap, int object_size, AllocationHint hint);
 
   void PromoteNewLargeObject(LargePage* page);
 
  protected:
   explicit OldLargeObjectSpace(Heap* heap, AllocationSpace id);
-  V8_WARN_UNUSED_RESULT AllocationResult AllocateRaw(int object_size,
-                                                     Executability executable);
-  V8_WARN_UNUSED_RESULT AllocationResult AllocateRawBackground(
-      LocalHeap* local_heap, int object_size, Executability executable);
+  V8_WARN_UNUSED_RESULT AllocationResult AllocateRaw(LocalHeap* local_heap,
+                                                     int object_size,
+                                                     Executability executable,
+                                                     AllocationHint hint);
 };
 
 class SharedLargeObjectSpace : public OldLargeObjectSpace {
  public:
   explicit SharedLargeObjectSpace(Heap* heap);
+};
 
-  V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT AllocationResult
-  AllocateRawBackground(LocalHeap* local_heap, int object_size);
+// Similar to the TrustedSpace, but for large objects.
+class TrustedLargeObjectSpace : public OldLargeObjectSpace {
+ public:
+  explicit TrustedLargeObjectSpace(Heap* heap);
+};
+
+// Similar to the TrustedLargeObjectSpace, but for shared objects.
+class SharedTrustedLargeObjectSpace : public OldLargeObjectSpace {
+ public:
+  explicit SharedTrustedLargeObjectSpace(Heap* heap);
 };
 
 class NewLargeObjectSpace : public LargeObjectSpace {
@@ -169,7 +161,7 @@ class NewLargeObjectSpace : public LargeObjectSpace {
   NewLargeObjectSpace(Heap* heap, size_t capacity);
 
   V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT AllocationResult
-  AllocateRaw(int object_size);
+  AllocateRaw(LocalHeap* local_heap, int object_size, AllocationHint hint);
 
   // Available bytes for objects in this space.
   size_t Available() const override;
@@ -189,10 +181,7 @@ class CodeLargeObjectSpace : public OldLargeObjectSpace {
   explicit CodeLargeObjectSpace(Heap* heap);
 
   V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT AllocationResult
-  AllocateRaw(int object_size);
-
-  V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT AllocationResult
-  AllocateRawBackground(LocalHeap* local_heap, int object_size);
+  AllocateRaw(LocalHeap* local_heap, int object_size, AllocationHint hint);
 
  protected:
   void AddPage(LargePage* page, size_t object_size) override;

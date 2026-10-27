@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --experimental-wasm-stringref --experimental-wasm-gc
+// Flags: --wasm-stringref
 
 d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
 
@@ -12,14 +12,14 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
   builder.addFunction("main", kSig_v_r)
     .addBody([
       kExprLocalGet, 0,
-      kGCPrefix, kExprExternInternalize,
+      kGCPrefix, kExprAnyConvertExtern,
       kGCPrefix, kExprRefCastNull, kStringViewWtf16Code,
       kExprDrop,
     ]).exportFunc();
 
   assertThrows(() => builder.instantiate().exports.main("foo"),
                WebAssembly.CompileError,
-               /string views are not classifiable/);
+               /has to be in the same reference type hierarchy/);
 })();
 
 (function TestView() {
@@ -28,14 +28,14 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
   builder.addFunction("main", kSig_v_r)
     .addBody([
       kExprLocalGet, 0,
-      kGCPrefix, kExprExternInternalize,
+      kGCPrefix, kExprAnyConvertExtern,
       kGCPrefix, kExprRefTestNull, kStringViewWtf16Code,
       kExprDrop,
     ]).exportFunc();
 
     assertThrows(() => builder.instantiate().exports.main("foo"),
                  WebAssembly.CompileError,
-                 /string views are not classifiable/);
+                 /has to be in the same reference type hierarchy/);
 })();
 
 (function TestBranchOnCast() {
@@ -47,15 +47,15 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
     .addBody([
       kExprBlock, kWasmVoid,
       kExprLocalGet, 0,
-      kGCPrefix, kExprExternInternalize,
-      kGCPrefix, kExprBrOnCastGeneric, 0b11, 0, kAnyRefCode, view,
+      kGCPrefix, kExprAnyConvertExtern,
+      kGCPrefix, kExprBrOnCast, 0b11, 0, kAnyRefCode, view,
       kExprDrop,
       kExprEnd,
     ]).exportFunc();
 
     assertThrows(() => builder.instantiate().exports.main("foo"),
                  WebAssembly.CompileError,
-                 /invalid types for br_on_cast/);
+                 /nullable string views don't exist/);
 })();
 
 (function TestBranchOnCastFail() {
@@ -65,15 +65,17 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
 
   builder.addFunction("main", kSig_v_r)
     .addBody([
-      kExprBlock, kWasmVoid,
+      kExprBlock, kAnyRefCode,
       kExprLocalGet, 0,
-      kGCPrefix, kExprExternInternalize,
-      kGCPrefix, kExprBrOnCastFailGeneric, 0b11, 0, kAnyRefCode, view,
+      kGCPrefix, kExprAnyConvertExtern,
+      kGCPrefix, kExprBrOnCastFail, 0b11, 0, kAnyRefCode, view,
       kExprDrop,
+      kExprRefNull, kAnyRefCode,
       kExprEnd,
+      kExprDrop,
     ]).exportFunc();
 
     assertThrows(() => builder.instantiate().exports.main("foo"),
                  WebAssembly.CompileError,
-                 /invalid types for br_on_cast/);
+                 /nullable string views don't exist/);
 })();

@@ -25,6 +25,9 @@ struct PropInfo {
 
 typedef size_t SnapshotIndex;
 
+bool WithoutCodeCache(const SnapshotFlags& flags);
+bool WithoutCodeCache(const SnapshotConfig& config);
+
 // When serializing an embedder object, we'll serialize the native states
 // into a chunk that can be mapped into a subclass of InternalFieldInfoBase,
 // and pass it into the V8 callback as the payload of StartupData.
@@ -38,25 +41,22 @@ struct InternalFieldInfoBase {
   EmbedderObjectType type;
   size_t length;
 
-  template <typename T>
+  template <std::derived_from<InternalFieldInfoBase> T>
   static T* New(EmbedderObjectType type) {
-    static_assert(std::is_base_of_v<InternalFieldInfoBase, T> ||
-                      std::is_same_v<InternalFieldInfoBase, T>,
-                  "Can only accept InternalFieldInfoBase subclasses");
     void* buf = ::operator new[](sizeof(T));
     T* result = new (buf) T;
+    // Zero the padding to make the bytes handed to V8 reproducible. Must come
+    // after the placement new, or -flifetime-dse drops it as a dead store.
+    // https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html#index-fno-lifetime-dse
+    memset(static_cast<void*>(result), 0, sizeof(T));
     result->type = type;
     result->length = sizeof(T);
     return result;
   }
 
-  template <typename T>
+  template <std::derived_from<InternalFieldInfoBase> T>
+    requires std::is_trivially_copyable_v<T>
   T* Copy() const {
-    static_assert(std::is_base_of_v<InternalFieldInfoBase, T> ||
-                      std::is_same_v<InternalFieldInfoBase, T>,
-                  "Can only accept InternalFieldInfoBase subclasses");
-    static_assert(std::is_trivially_copyable_v<T>,
-                  "Can only memcpy trivially copyable class");
     void* buf = ::operator new[](sizeof(T));
     T* result = new (buf) T;
     memcpy(result, this, sizeof(T));
@@ -123,10 +123,17 @@ class SnapshotableObject : public BaseObject {
 v8::StartupData SerializeNodeContextInternalFields(v8::Local<v8::Object> holder,
                                                    int index,
                                                    void* env);
+v8::StartupData SerializeNodeContextData(v8::Local<v8::Context> holder,
+                                         int index,
+                                         void* env);
 void DeserializeNodeInternalFields(v8::Local<v8::Object> holder,
                                    int index,
                                    v8::StartupData payload,
                                    void* env);
+void DeserializeNodeContextData(v8::Local<v8::Context> holder,
+                                int index,
+                                v8::StartupData payload,
+                                void* env);
 void SerializeSnapshotableObjects(Realm* realm,
                                   v8::SnapshotCreator* creator,
                                   RealmSerializeInfo* info);
@@ -154,7 +161,6 @@ class BindingData : public SnapshotableObject {
   AliasedUint8Array is_building_snapshot_buffer_;
   InternalFieldInfo* internal_field_info_ = nullptr;
 };
-
 }  // namespace mksnapshot
 
 }  // namespace node

@@ -10,6 +10,7 @@ const {
 } = require('internal/webstreams/adapters');
 
 const {
+  Duplex,
   PassThrough,
 } = require('stream');
 
@@ -247,4 +248,34 @@ const {
   const writer = writable.getWriter();
   reader.closed.then(common.mustCall());
   writer.close().then(common.mustCall());
+}
+
+{
+  assert.throws(() => newReadableWritablePairFromDuplex(null), {
+    code: 'ERR_INVALID_ARG_TYPE'
+  });
+}
+
+{
+  const duplex = new Duplex({
+    allowHalfOpen: false,
+    read() {},
+    write(chunk, enc, cb) { cb(); },
+    final(cb) { setImmediate(cb); },
+  });
+
+  const {
+    readable,
+    writable,
+  } = newReadableWritablePairFromDuplex(duplex);
+
+  const reader = readable.getReader();
+  const writer = writable.getWriter();
+
+  duplex.push(null);
+
+  reader.read().then(common.mustCall(({ done }) => {
+    assert.strictEqual(done, true);
+    writer.close().then(common.mustCall());
+  }));
 }

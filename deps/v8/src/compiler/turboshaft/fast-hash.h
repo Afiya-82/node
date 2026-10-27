@@ -5,10 +5,14 @@
 #ifndef V8_COMPILER_TURBOSHAFT_FAST_HASH_H_
 #define V8_COMPILER_TURBOSHAFT_FAST_HASH_H_
 
+#include <array>
+#include <optional>
 #include <tuple>
 
-#include "src/base/functional.h"
+#include "src/base/hashing.h"
 #include "src/base/vector.h"
+#include "src/handles/handles.h"
+#include "src/handles/maybe-handles.h"
 
 namespace v8::internal::compiler::turboshaft {
 
@@ -27,11 +31,18 @@ V8_INLINE size_t fast_hash_combine(T const& v, Ts const&... vs);
 template <class T>
 struct fast_hash {
   size_t operator()(const T& v) const {
-    if constexpr (std::is_enum<T>::value) {
+    if constexpr (std::is_enum_v<T>) {
       return static_cast<size_t>(v);
     } else {
       return base::hash<T>()(v);
     }
+  }
+};
+
+template <typename T>
+struct fast_hash<std::optional<T>> {
+  size_t operator()(const std::optional<T>& v) const {
+    return v.has_value() ? (fast_hash<T>()(*v) << 1) + 1 : 0;
   }
 };
 
@@ -72,6 +83,27 @@ V8_INLINE size_t fast_hash_range(Iterator first, Iterator last) {
 template <typename T>
 struct fast_hash<base::Vector<T>> {
   V8_INLINE size_t operator()(base::Vector<T> v) const {
+    return fast_hash_range(v.begin(), v.end());
+  }
+};
+
+template <typename T>
+struct fast_hash<IndirectHandle<T>> {
+  V8_INLINE size_t operator()(IndirectHandle<T> v) const {
+    return fast_hash<Address>()(v.address());
+  }
+};
+
+template <typename T>
+struct fast_hash<MaybeIndirectHandle<T>> {
+  V8_INLINE size_t operator()(MaybeIndirectHandle<T> v) const {
+    return fast_hash<Address>()(v.address());
+  }
+};
+
+template <typename T, size_t N>
+struct fast_hash<std::array<T, N>> {
+  V8_INLINE size_t operator()(const std::array<T, N>& v) const {
     return fast_hash_range(v.begin(), v.end());
   }
 };

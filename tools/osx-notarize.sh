@@ -34,22 +34,45 @@ then
     exit 1
 fi
 
-# Submit the package for notarization
-# TODO(@ulisesGascon): refactor to use --keychain-profile
-# when https://github.com/nodejs/build/issues/3385#issuecomment-1729281269 is ready
 echo "Submitting node-$pkgid.pkg for notarization..."
 
 xcrun notarytool submit \
-  --apple-id "$NOTARIZATION_ID" \
-  --password "$NOTARIZATION_PASSWORD" \
-  --team-id "$NOTARIZATION_TEAM_ID" \
+  --keychain-profile "NODE_RELEASE_PROFILE" \
   --wait \
   "node-$pkgid.pkg"
 
 if [ $? -eq 0 ]; then
   echo "Notarization node-$pkgid.pkg submitted successfully."
-  exit 0
 else
   echo "Notarization node-$pkgid.pkg failed."
   exit 1
 fi
+
+# The notarization ticket can take a while to become available from Apple's
+# servers after notarytool reports "Accepted", so retry with backoff.
+retry() {
+  delay=15
+  attempt=1
+  while ! "$@"; do
+    if [ "$attempt" -ge 6 ]; then
+      return 1
+    fi
+    echo "Attempt $attempt failed, retrying in ${delay}s..."
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+}
+
+if ! retry xcrun spctl --assess --type install --context context:primary-signature --ignore-cache --verbose=2 "node-$pkgid.pkg"; then
+  echo "error: Signature will not be accepted by Gatekeeper!" 1>&2
+  exit 1
+else
+  echo "Verification was successful."
+fi
+
+if ! retry xcrun stapler staple "node-$pkgid.pkg"; then
+  echo "error: Stapling node-$pkgid.pkg failed." 1>&2
+  exit 1
+fi
+echo "Stapler was successful."

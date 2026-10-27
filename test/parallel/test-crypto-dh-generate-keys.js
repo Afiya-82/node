@@ -8,7 +8,7 @@ const assert = require('assert');
 const crypto = require('crypto');
 
 {
-  const size = common.hasFipsCrypto || common.hasOpenSSL3 ? 1024 : 256;
+  const prime = crypto.getDiffieHellman('modp14').getPrime();
 
   function unlessInvalidState(f) {
     try {
@@ -21,7 +21,7 @@ const crypto = require('crypto');
   }
 
   function testGenerateKeysChangesKeys(setup, expected) {
-    const dh = crypto.createDiffieHellman(size);
+    const dh = crypto.createDiffieHellman(prime);
     setup(dh);
     const firstPublicKey = unlessInvalidState(() => dh.getPublicKey());
     const firstPrivateKey = unlessInvalidState(() => dh.getPrivateKey());
@@ -55,9 +55,9 @@ const crypto = require('crypto');
   }, ['public']);
 
   // The public key is outdated: generateKeys() generates only the public key.
-  testGenerateKeysChangesKeys((dh) => {
+  testGenerateKeysChangesKeys(common.mustCall((dh) => {
     const oldPublicKey = dh.generateKeys();
     dh.setPrivateKey(Buffer.from('01020304', 'hex'));
     assert.deepStrictEqual(dh.getPublicKey(), oldPublicKey);
-  }, ['public']);
+  }), ['public']);
 }

@@ -3,7 +3,7 @@
 const common = require('../common');
 const assert = require('assert');
 const http = require('http');
-const { kHighWaterMark } = require('_http_outgoing');
+const { kHighWaterMark } = require('internal/http/outgoing');
 
 const { getDefaultHighWaterMark } = require('internal/streams/state');
 
@@ -11,12 +11,12 @@ function listen(server) {
   server.listen(0, common.mustCall(() => {
     http.get({
       port: server.address().port,
-    }, (res) => {
+    }, common.mustCall((res) => {
       assert.strictEqual(res.statusCode, 200);
       res.resume().on('end', common.mustCall(() => {
         server.close();
       }));
-    });
+    }));
   }));
 }
 

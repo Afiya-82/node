@@ -1,9 +1,9 @@
-const { fixer } = require('normalize-package-data')
 const npmFetch = require('npm-registry-fetch')
 const npa = require('npm-package-arg')
-const log = require('proc-log')
+const PackageJson = require('@npmcli/package-json')
+const { log } = require('proc-log')
 const semver = require('semver')
-const { URL } = require('url')
+const { URL } = require('node:url')
 const ssri = require('ssri')
 const ciInfo = require('ci-info')
 
@@ -20,10 +20,18 @@ Remove the 'private' field from the package.json to publish it.`),
     )
   }
 
+  // packageExtensions is root-only project policy and must never reach the registry manifest or the published tarball
+  if (manifest.packageExtensions !== undefined) {
+    throw Object.assign(
+      new Error('packageExtensions is only honored at the project root and must not be published.'),
+      { code: 'EPACKAGEEXTENSIONS' }
+    )
+  }
+
   // spec is used to pick the appropriate registry/auth combo
   const spec = npa.resolve(manifest.name, manifest.version)
   opts = {
-    access: 'public',
+    access: null,
     algorithms: ['sha512'],
     defaultTag: 'latest',
     ...opts,
@@ -31,7 +39,7 @@ Remove the 'private' field from the package.json to publish it.`),
   }
 
   const reg = npmFetch.pickRegistry(spec, opts)
-  const pubManifest = patchManifest(manifest, opts)
+  const pubManifest = await patchManifest(manifest, opts)
 
   // registry-frontdoor cares about the access level,
   // which is only configurable for scoped packages
@@ -50,29 +58,35 @@ Remove the 'private' field from the package.json to publish it.`),
     opts
   )
 
-  const res = await npmFetch(spec.escapedName, {
+  const stageRoute = `/-/stage/package/${spec.escapedName}`
+  const res = await npmFetch(opts.stage ? stageRoute : spec.escapedName, {
     ...opts,
-    method: 'PUT',
+    method: opts.stage ? 'POST' : 'PUT',
     body: metadata,
-    ignoreBody: true,
+    ignoreBody: !opts.stage,
   })
   if (transparencyLogUrl) {
     res.transparencyLogUrl = transparencyLogUrl
   }
+  if (opts.stage) {
+    const json = await res.json()
+    res.stageId = json.stageId
+  }
   return res
 }
 
-const patchManifest = (_manifest, opts) => {
+const patchManifest = async (_manifest, opts) => {
   const { npmVersion } = opts
-  // we only update top-level fields, so a shallow clone is fine
-  const manifest = { ..._manifest }
-
-  manifest._nodeVersion = process.versions.node
-  if (npmVersion) {
-    manifest._npmVersion = npmVersion
+  const steps = ['fixName']
+  const manifestInput = { ..._manifest, _nodeVersion: process.versions.node }
+  if (npmVersion != null) {
+    manifestInput._npmVersion = npmVersion
   }
+  const manifest = await new PackageJson()
+    .fromContent(manifestInput)
+    .normalize({ steps })
+    .then(p => p.content)
 
-  fixer.fixNameField(manifest, { strict: true, allowLegacyCase: true })
   const version = semver.clean(manifest.version)
   if (!version) {
     throw Object.assign(
@@ -81,11 +95,13 @@ const patchManifest = (_manifest, opts) => {
     )
   }
   manifest.version = version
+  // patchedDependencies is consumer-side state and must never be published
+  delete manifest.patchedDependencies
   return manifest
 }
 
 const buildMetadata = async (registry, manifest, tarballData, spec, opts) => {
-  const { access, defaultTag, algorithms, provenance, provenanceFile } = opts
+  const { access, defaultTag, algorithms, provenance, provenanceFile, command = 'publish' } = opts
   const root = {
     _id: manifest.name,
     name: manifest.name,
@@ -128,6 +144,12 @@ const buildMetadata = async (registry, manifest, tarballData, spec, opts) => {
 
   // Handle case where --provenance flag was set to true
   let transparencyLogUrl
+  if (provenance === true && provenanceFile) {
+    throw Object.assign(
+      new Error('provenance and provenanceFile cannot be used together'),
+      { code: 'EUSAGE' }
+    )
+  }
   if (provenance === true || provenanceFile) {
     let provenanceBundle
     const subject = {
@@ -140,14 +162,14 @@ const buildMetadata = async (registry, manifest, tarballData, spec, opts) => {
       provenanceBundle = await generateProvenance([subject], opts)
 
       /* eslint-disable-next-line max-len */
-      log.notice('publish', `Signed provenance statement with source and build information from ${ciInfo.name}`)
+      log.notice(command, `Signed provenance statement with source and build information from ${ciInfo.name}`)
 
       const tlogEntry = provenanceBundle?.verificationMaterial?.tlogEntries[0]
       /* istanbul ignore else */
       if (tlogEntry) {
         transparencyLogUrl = `${TLOG_BASE_URL}?logIndex=${tlogEntry.logIndex}`
         log.notice(
-          'publish',
+          command,
           `Provenance statement published to transparency log: ${transparencyLogUrl}`
         )
       }
@@ -204,7 +226,7 @@ const ensureProvenanceGeneration = async (registry, spec, opts) => {
   if (opts.access !== 'public') {
     try {
       const res = await npmFetch
-        .json(`${registry}/-/package/${spec.escapedName}/visibility`, opts)
+        .json(`/-/package/${spec.escapedName}/visibility`, { ...opts, registry })
       visibility = res
     } catch (err) {
       if (err.code !== 'E404') {

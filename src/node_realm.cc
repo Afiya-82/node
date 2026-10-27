@@ -11,21 +11,24 @@ namespace node {
 using v8::Context;
 using v8::EscapableHandleScope;
 using v8::HandleScope;
+using v8::Isolate;
 using v8::Local;
 using v8::MaybeLocal;
 using v8::Object;
 using v8::SnapshotCreator;
 using v8::String;
+using v8::TryCatch;
 using v8::Value;
 
 Realm::Realm(Environment* env, v8::Local<v8::Context> context, Kind kind)
-    : env_(env), isolate_(context->GetIsolate()), kind_(kind) {
+    : env_(env), isolate_(Isolate::GetCurrent()), kind_(kind) {
   context_.Reset(isolate_, context);
   env->AssignToContext(context, this, ContextInfo(""));
 }
 
 Realm::~Realm() {
   CHECK_EQ(base_object_count_, 0);
+  CHECK(cppgc_wrapper_list_.IsEmpty());
 }
 
 void Realm::MemoryInfo(MemoryTracker* tracker) const {
@@ -34,7 +37,8 @@ void Realm::MemoryInfo(MemoryTracker* tracker) const {
   PER_REALM_STRONG_PERSISTENT_VALUES(V)
 #undef V
 
-  tracker->TrackField("cleanup_queue", cleanup_queue_);
+  tracker->TrackField("base_object_list", base_object_list_);
+  tracker->TrackField("cppgc_wrapper_list", cppgc_wrapper_list_);
   tracker->TrackField("builtins_with_cache", builtins_with_cache);
   tracker->TrackField("builtins_without_cache", builtins_without_cache);
 }
@@ -44,16 +48,26 @@ void Realm::CreateProperties() {
   Local<Context> ctx = context();
 
   // Store primordials setup by the per-context script in the environment.
-  Local<Object> per_context_bindings =
-      GetPerContextExports(ctx).ToLocalChecked();
-  Local<Value> primordials =
-      per_context_bindings->Get(ctx, env_->primordials_string())
-          .ToLocalChecked();
+  TryCatch try_catch(isolate_);
+  Local<Object> per_context_bindings;
+  Local<Value> primordials;
+  if (!GetPerContextExports(ctx, env_->isolate_data())
+           .ToLocal(&per_context_bindings) ||
+      !per_context_bindings->Get(ctx, env_->primordials_string())
+           .ToLocal(&primordials)) {
+    // In general, this should only throw exceptions during local development
+    // when there's a temporary bug in the scripts. Print the exception here to
+    // facilitate debugging.
+    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+      PrintCaughtException(isolate_, ctx, try_catch);
+    }
+    env_->Exit(ExitCode::kBootstrapFailure);
+    return;
+  }
   CHECK(primordials->IsObject());
   set_primordials(primordials.As<Object>());
 
-  Local<String> prototype_string =
-      FIXED_ONE_BYTE_STRING(isolate(), "prototype");
+  Local<String> prototype_string = env_->prototype_string();
 
 #define V(EnvPropertyName, PrimordialsPropertyName)                            \
   {                                                                            \
@@ -215,7 +229,8 @@ void Realm::RunCleanup() {
   for (size_t i = 0; i < binding_data_store_.size(); ++i) {
     binding_data_store_[i].reset();
   }
-  cleanup_queue_.Drain();
+  base_object_list_.Cleanup();
+  cppgc_wrapper_list_.Cleanup();
 }
 
 void Realm::PrintInfoForSnapshot() {
@@ -223,7 +238,7 @@ void Realm::PrintInfoForSnapshot() {
   fprintf(stderr, "BaseObjects of the Realm:\n");
   size_t i = 0;
   ForEachBaseObject([&](BaseObject* obj) {
-    std::cout << "#" << i++ << " " << obj << ": " << obj->MemoryInfoName()
+    std::cerr << "#" << i++ << " " << obj << ": " << obj->MemoryInfoName()
               << "\n";
   });
 
@@ -273,10 +288,6 @@ void Realm::VerifyNoStrongBaseObjects() {
     fflush(stderr);
     ABORT();
   });
-}
-
-v8::Local<v8::Context> Realm::context() const {
-  return PersistentToLocal::Strong(context_);
 }
 
 // Per-realm strong value accessors. The per-realm values should avoid being
@@ -344,10 +355,11 @@ MaybeLocal<Value> PrincipalRealm::BootstrapRealm() {
     return MaybeLocal<Value>();
   }
 
+  // Setup process.env proxy.
   Local<String> env_string = FIXED_ONE_BYTE_STRING(isolate_, "env");
   Local<Object> env_proxy;
-  CreateEnvProxyTemplate(isolate_, env_->isolate_data());
-  if (!env_->env_proxy_template()->NewInstance(context()).ToLocal(&env_proxy) ||
+  if (!isolate_data()->env_proxy_template()->NewInstance(context()).ToLocal(
+          &env_proxy) ||
       process_object()->Set(context(), env_string, env_proxy).IsNothing()) {
     return MaybeLocal<Value>();
   }

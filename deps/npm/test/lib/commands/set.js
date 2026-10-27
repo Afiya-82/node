@@ -1,8 +1,14 @@
 const t = require('tap')
-const fs = require('fs/promises')
+const fs = require('node:fs/promises')
 const mockNpm = require('../../fixtures/mock-npm')
-const { join } = require('path')
+const { join } = require('node:path')
 const { cleanNewlines } = require('../../fixtures/clean-snapshot')
+
+t.test('completion', async t => {
+  const { set } = await mockNpm(t, { command: 'set' })
+  const res = await set.completion({ conf: { argv: { remain: ['npm', 'set'] } } })
+  t.type(res, Array)
+})
 
 t.test('no args', async t => {
   const { npm } = await mockNpm(t)
@@ -12,13 +18,13 @@ t.test('no args', async t => {
 t.test('test-config-item', async t => {
   const { npm, home, joinedOutput } = await mockNpm(t, {
     homeDir: {
-      '.npmrc': 'original-config-test=original value',
+      '.npmrc': 'tag=beta',
     },
   })
 
   t.equal(
-    npm.config.get('original-config-test'),
-    'original value',
+    npm.config.get('tag'),
+    'beta',
     'original config is set from npmrc'
   )
 
@@ -40,7 +46,7 @@ t.test('test-config-item', async t => {
   t.equal(
     cleanNewlines(await fs.readFile(join(home, '.npmrc'), 'utf-8')),
     [
-      'original-config-test=original value',
+      'tag=beta',
       'fund=true',
       '',
     ].join('\n'),

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --experimental-wasm-gc --experimental-wasm-stringref
+// Flags: --wasm-stringref
 
 d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
 
@@ -30,14 +30,31 @@ for (let [name, code] of [['string', kStringRefCode],
 
   assertValid(b => b.addType(makeSig([code], [])));
   assertValid(b => b.addStruct([makeField(code, true)]));
-  assertValid(b => b.addArray(code, true));
+  assertValid(b => b.addArray(code));
   assertValid(b => b.addType(makeSig([], [code])));
-  assertValid(b => b.addGlobal(code, true, default_init));
-  assertValid(b => b.addTable(code, 0));
-  assertValid(b => b.addPassiveElementSegment([default_init], code));
   assertValid(b => b.addTag(makeSig([code], [])));
   assertValid(
     b => b.addFunction(undefined, kSig_v_v).addLocals(code, 1).addBody([]));
+  if (name.startsWith("stringview_")) {
+    // String views aren't defaultable because they aren't nullable.
+    assertInvalid(b => b.addGlobal(code, true, false, default_init));
+    assertInvalid(b => b.addTable(code, 0));
+    assertInvalid(b => b.addPassiveElementSegment([default_init], code));
+    assertInvalid(
+        b => b.addFunction(undefined, kSig_v_v).addLocals(code, 1).addBody([
+          kExprLocalGet, 0,
+          kExprDrop,
+        ]));
+    assertInvalid(
+        b => b.addFunction(undefined, kSig_v_v).addBody([
+          kExprRefNull, code,
+          kExprDrop,
+        ]));
+    } else {
+    assertValid(b => b.addGlobal(code, true, false, default_init));
+    assertValid(b => b.addTable(code, 0));
+    assertValid(b => b.addPassiveElementSegment([default_init], code));
+  }
 }
 
 let kSig_w_i = makeSig([kWasmI32], [kWasmStringRef]);
@@ -263,8 +280,8 @@ let kSig_w_zi = makeSig([kWasmStringViewIter, kWasmI32],
       ...GCInstr(kExprStringHash)
     ]);
 
-  let i8_array = builder.addArray(kWasmI8, true);
-  let i16_array = builder.addArray(kWasmI16, true);
+  let i8_array = builder.addArray(kWasmI8);
+  let i16_array = builder.addArray(kWasmI16);
 
   builder.addFunction("string.new_utf8_array", kSig_w_v)
     .addBody([
@@ -364,7 +381,7 @@ assertInvalid(
         ...GCInstr(kExprStringNewWtf8), 1
       ]);
   },
-  /expected a single 0 byte for the memory index, found 1 encoded in 1 bytes/);
+  /memory index 1 exceeds number of declared memories \(1\)/);
 
 assertInvalid(
   builder => {
@@ -385,11 +402,11 @@ assertInvalid(
         ...GCInstr(kExprStringEncodeWtf8), 1
       ]);
   },
-  /expected a single 0 byte for the memory index, found 1 encoded in 1 bytes/);
+  /memory index 1 exceeds number of declared memories \(1\)/);
 
 assertInvalid(
   builder => {
-    let i16_array = builder.addArray(kWasmI16, true);
+    let i16_array = builder.addArray(kWasmI16);
     builder.addFunction("string.new_wtf8_array/bad-type", kSig_w_v)
       .addBody([
         kExprRefNull, i16_array,
@@ -402,7 +419,7 @@ assertInvalid(
 
 assertInvalid(
   builder => {
-    let i8_array = builder.addArray(kWasmI8, true);
+    let i8_array = builder.addArray(kWasmI8);
     builder.addFunction("string.new_wtf16_array/bad-type", kSig_w_v)
       .addBody([
         kExprRefNull, i8_array,
@@ -415,7 +432,7 @@ assertInvalid(
 
 assertInvalid(
   builder => {
-    let immutable_i8_array = builder.addArray(kWasmI8, false);
+    let immutable_i8_array = builder.addArray(kWasmI8, {mutable: false});
     let sig = makeSig([kWasmStringRef,
                        wasmRefType(immutable_i8_array),
                        kWasmI32],
@@ -432,7 +449,7 @@ assertInvalid(
 
 assertInvalid(
   builder => {
-    let immutable_i16_array = builder.addArray(kWasmI16, false);
+    let immutable_i16_array = builder.addArray(kWasmI16, {mutable: false});
     let sig = makeSig([kWasmStringRef,
                        wasmRefType(immutable_i16_array),
                        kWasmI32],

@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --experimental-wasm-gc
-
 d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
 
 (function TestArrayNewElem() {
@@ -11,7 +9,7 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
   let builder = new WasmModuleBuilder();
   let struct_type_index = builder.addStruct([makeField(kWasmI32, false)]);
   let struct_type = wasmRefNullType(struct_type_index);
-  let array_type_index = builder.addArray(struct_type, true);
+  let array_type_index = builder.addArray(struct_type);
 
   function makeStruct(element) {
     return [...wasmI32Const(element),
@@ -108,7 +106,7 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
   let builder = new WasmModuleBuilder();
   let struct_type_index = builder.addStruct([makeField(kWasmI32, false)]);
   let struct_type = wasmRefNullType(struct_type_index);
-  let array_type_index = builder.addArray(struct_type, true);
+  let array_type_index = builder.addArray(struct_type);
   let array_type = wasmRefNullType(array_type_index);
 
   function makeStruct(element) {
@@ -148,7 +146,6 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
     .addBody([
       kExprLocalGet, 0,  // offset in table
       kExprTableGet, table,
-      kGCPrefix, kExprRefAsArray,
       kGCPrefix, kExprRefCast, array_type_index,
       kExprLocalGet, 1,  // index in the array
       kGCPrefix, kExprArrayGet, array_type_index,
@@ -190,7 +187,7 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
   let builder = new WasmModuleBuilder();
   let struct_type_index = builder.addStruct([makeField(kWasmI32, false)]);
   let struct_type = wasmRefNullType(struct_type_index);
-  let array_type_index = builder.addArray(struct_type, true);
+  let array_type_index = builder.addArray(struct_type);
 
   let passive_segment = builder.addPassiveElementSegment([
     [kExprRefNull, array_type_index]],
@@ -220,14 +217,14 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
   let builder = new WasmModuleBuilder();
   let struct_type_index = builder.addStruct([makeField(kWasmI32, false)]);
   let struct_type = wasmRefNullType(struct_type_index);
-  let array_type_index = builder.addArray(struct_type, true);
+  let array_type_index = builder.addArray(struct_type);
 
   let passive_segment = builder.addPassiveElementSegment([
     [kExprRefNull, struct_type_index]],
     struct_type_index);
 
   builder.addGlobal(
-    wasmRefNullType(array_type_index), false,
+    wasmRefNullType(array_type_index), false, false,
     [...wasmI32Const(0), ...wasmI32Const(1),
      kGCPrefix, kExprArrayNewElem,
      array_type_index, passive_segment]);
@@ -241,7 +238,7 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
   let builder = new WasmModuleBuilder();
   let struct_type_index = builder.addStruct([makeField(kWasmI32, false)]);
   let struct_type = wasmRefNullType(struct_type_index);
-  let array_type_index = builder.addArray(struct_type, true);
+  let array_type_index = builder.addArray(struct_type);
   let array_type = wasmRefNullType(array_type_index);
 
   function makeStruct(element) {
@@ -280,7 +277,7 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
   let builder = new WasmModuleBuilder();
   let struct_type_index = builder.addStruct([makeField(kWasmI32, false)]);
   let struct_type = wasmRefNullType(struct_type_index);
-  let array_type_index = builder.addArray(struct_type, true);
+  let array_type_index = builder.addArray(struct_type);
   let array_type = wasmRefNullType(array_type_index);
 
   function makeStruct(element) {
@@ -319,7 +316,7 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
   let builder = new WasmModuleBuilder();
   let struct_type_index = builder.addStruct([makeField(kWasmI32, false)]);
   let struct_type = wasmRefNullType(struct_type_index);
-  let array_type_index = builder.addArray(struct_type, true);
+  let array_type_index = builder.addArray(struct_type);
   let array_type = wasmRefNullType(array_type_index);
 
   function makeStruct(element) {
@@ -359,7 +356,7 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
 (function TestArrayNewData() {
   print(arguments.callee.name);
   let builder = new WasmModuleBuilder();
-  let array_type_index = builder.addArray(kWasmI16, true);
+  let array_type_index = builder.addArray(kWasmI16);
 
   let dummy_byte = 0xff;
   let element_0 = 1000;
@@ -372,7 +369,7 @@ d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
   // TODO(14034): Reenable when we have constant array.new_data.
   /*
   let global = builder.addGlobal(
-    wasmRefType(array_type_index), true,
+    wasmRefType(array_type_index), true, false,
     [...wasmI32Const(1), ...wasmI32Const(2),
      kGCPrefix, kExprArrayNewData, array_type_index, data_segment],
     builder);

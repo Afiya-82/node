@@ -8,7 +8,7 @@
       'includes': ['config/archs/linux64-s390x/asm/openssl.gypi'],
     }, 'target_arch=="arm" and OS=="linux"', {
       'includes': ['config/archs/linux-armv4/asm/openssl.gypi'],
-    }, 'target_arch=="arm64" and OS=="linux"', {
+    }, 'target_arch=="arm64" and OS in "linux openharmony"', {
       'includes': ['config/archs/linux-aarch64/asm/openssl.gypi'],
     }, 'target_arch=="arm64" and OS=="mac"', {
       'includes': ['config/archs/darwin64-arm64-cc/asm/openssl.gypi'],
@@ -16,8 +16,6 @@
       'includes': ['config/archs/BSD-x86/asm/openssl.gypi'],
     }, 'target_arch=="ia32" and OS=="linux"', {
       'includes': ['config/archs/linux-elf/asm/openssl.gypi'],
-    }, 'target_arch=="ia32" and OS=="mac"', {
-      'includes': ['config/archs/darwin-i386-cc/asm/openssl.gypi'],
     }, 'target_arch=="ia32" and OS=="solaris"', {
       'includes': ['config/archs/solaris-x86-gcc/asm/openssl.gypi'],
     }, 'target_arch=="ia32" and OS=="win"', {
@@ -71,9 +69,14 @@
       'includes': ['config/archs/linux-x86_64/asm/openssl.gypi'],
     }, 'target_arch=="mips64el" and OS=="linux"', {
       'includes': ['config/archs/linux64-mips64/asm/openssl.gypi'],
+    }, 'target_arch=="riscv64" and OS=="linux"', {
+      'includes': ['config/archs/linux64-riscv64/asm/openssl.gypi'],
     }, {
       # Other architectures don't use assembly
       'includes': ['config/archs/linux-x86_64/asm/openssl.gypi'],
+    }],
+    [ 'clang==1 and OS!="win"', {
+      'cflags': [ '-Wno-unused-command-line-argument' ],
     }],
   ],
 }

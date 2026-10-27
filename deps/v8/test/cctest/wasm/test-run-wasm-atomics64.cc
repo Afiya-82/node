@@ -181,7 +181,7 @@ WASM_EXEC_TEST(I64AtomicCompareExchange16U) {
   }
 }
 
-WASM_EXEC_TEST(I32AtomicCompareExchange8U) {
+WASM_EXEC_TEST(I64AtomicCompareExchange8U) {
   WasmRunner<uint64_t, uint64_t, uint64_t> r(execution_tier);
   uint8_t* memory = r.builder().AddMemoryElems<uint8_t>(kWasmPageSize);
   r.builder().SetMemoryShared();
@@ -198,6 +198,34 @@ WASM_EXEC_TEST(I32AtomicCompareExchange8U) {
     }
   }
 }
+
+#define WASM_TEST_CAS_PRESERVES_EXPECTED(Name, CType, Representation)     \
+  WASM_EXEC_TEST(I64AtomicCompareExchange##Name##PreservesExpected) {     \
+    WasmRunner<uint64_t, uint64_t, uint64_t> r(execution_tier);           \
+    CType* memory =                                                       \
+        r.builder().AddMemoryElems<CType>(kWasmPageSize / sizeof(CType)); \
+    r.builder().SetMemoryShared();                                        \
+    r.Build({WASM_ATOMICS_TERNARY_OP(kExprI64AtomicCompareExchange##Name, \
+                                     WASM_I32V_1(0), WASM_LOCAL_GET(0),   \
+                                     WASM_LOCAL_GET(1), Representation),  \
+             WASM_DROP, WASM_LOCAL_GET(0)});                              \
+    FOR_UINT64_INPUTS(i) {                                                \
+      CType initial = static_cast<CType>(i);                              \
+      FOR_UINT64_INPUTS(j) {                                              \
+        CType replacement = static_cast<CType>(j);                        \
+        r.builder().WriteMemory(&memory[0], initial);                     \
+        CHECK_EQ(i, r.Call(i, j));                                        \
+        CType expected =                                                  \
+            CompareExchange(initial, static_cast<CType>(i), replacement); \
+        CHECK_EQ(expected, r.builder().ReadMemory(&memory[0]));           \
+      }                                                                   \
+    }                                                                     \
+  }
+
+WASM_TEST_CAS_PRESERVES_EXPECTED(8U, uint8_t, MachineRepresentation::kWord8)
+WASM_TEST_CAS_PRESERVES_EXPECTED(16U, uint16_t, MachineRepresentation::kWord16)
+WASM_TEST_CAS_PRESERVES_EXPECTED(32U, uint32_t, MachineRepresentation::kWord32)
+#undef WASM_TEST_CAS_PRESERVES_EXPECTED
 
 WASM_EXEC_TEST(I64AtomicLoad) {
   WasmRunner<uint64_t> r(execution_tier);
@@ -491,7 +519,7 @@ WASM_EXEC_TEST(I64AtomicConvertCompareExchange) {
 // The WASM_I64_EQ operation is used here to test that the index node
 // is lowered correctly.
 void RunNonConstIndexTest(TestExecutionTier execution_tier, WasmOpcode wasm_op,
-                          Uint64BinOp op) {
+                          Uint64BinOp op, MachineRepresentation rep) {
   WasmRunner<uint32_t, uint64_t> r(execution_tier);
   uint64_t* memory =
       r.builder().AddMemoryElems<uint64_t>(kWasmPageSize / sizeof(uint64_t));
@@ -499,7 +527,7 @@ void RunNonConstIndexTest(TestExecutionTier execution_tier, WasmOpcode wasm_op,
 
   r.Build({WASM_I32_CONVERT_I64(
       WASM_ATOMICS_BINOP(wasm_op, WASM_I64_EQ(WASM_I64V(1), WASM_I64V(0)),
-                         WASM_LOCAL_GET(0), MachineRepresentation::kWord32))});
+                         WASM_LOCAL_GET(0), rep))});
 
   uint64_t initial = 0x1111222233334444, local = 0x5555666677778888;
   r.builder().WriteMemory(&memory[0], initial);
@@ -509,17 +537,19 @@ void RunNonConstIndexTest(TestExecutionTier execution_tier, WasmOpcode wasm_op,
 }
 
 // Test a set of Narrow operations
-#define TEST_OPERATION(Name)                                               \
-  WASM_EXEC_TEST(I64AtomicConstIndex##Name##Narrow) {                      \
-    RunNonConstIndexTest(execution_tier, kExprI64Atomic##Name##32U, Name); \
+#define TEST_OPERATION(Name)                                              \
+  WASM_EXEC_TEST(I64AtomicConstIndex##Name##Narrow) {                     \
+    RunNonConstIndexTest(execution_tier, kExprI64Atomic##Name##32U, Name, \
+                         MachineRepresentation::kWord32);                 \
   }
 WASM_ATOMIC_OPERATION_LIST(TEST_OPERATION)
 #undef TEST_OPERATION
 
 // Test a set of Regular operations
-#define TEST_OPERATION(Name)                                          \
-  WASM_EXEC_TEST(I64AtomicConstIndex##Name) {                         \
-    RunNonConstIndexTest(execution_tier, kExprI64Atomic##Name, Name); \
+#define TEST_OPERATION(Name)                                         \
+  WASM_EXEC_TEST(I64AtomicConstIndex##Name) {                        \
+    RunNonConstIndexTest(execution_tier, kExprI64Atomic##Name, Name, \
+                         MachineRepresentation::kWord64);            \
   }
 WASM_ATOMIC_OPERATION_LIST(TEST_OPERATION)
 #undef TEST_OPERATION
@@ -549,7 +579,7 @@ WASM_EXEC_TEST(I64AtomicNonConstIndexCompareExchange) {
 
   r.Build({WASM_I32_CONVERT_I64(WASM_ATOMICS_TERNARY_OP(
       kExprI64AtomicCompareExchange, WASM_I64_EQ(WASM_I64V(1), WASM_I64V(0)),
-      WASM_LOCAL_GET(0), WASM_LOCAL_GET(1), MachineRepresentation::kWord16))});
+      WASM_LOCAL_GET(0), WASM_LOCAL_GET(1), MachineRepresentation::kWord64))});
 
   uint64_t initial = 4444333322221111, local = 0x9999888877776666;
   r.builder().WriteMemory(&memory[0], initial);
@@ -606,7 +636,7 @@ WASM_EXEC_TEST(I64AtomicCompareExchange32UFail) {
 }
 
 WASM_EXEC_TEST(AtomicStoreNoConsideredEffectful) {
-  // Use {Load} instead of {ProtectedLoad}.
+  // Use {Load} instead of {TrappingLoad}.
   FLAG_SCOPE(wasm_enforce_bounds_checks);
   WasmRunner<uint32_t> r(execution_tier);
   r.builder().AddMemoryElems<int64_t>(kWasmPageSize / sizeof(int64_t));
@@ -619,7 +649,7 @@ WASM_EXEC_TEST(AtomicStoreNoConsideredEffectful) {
 }
 
 void RunNoEffectTest(TestExecutionTier execution_tier, WasmOpcode wasm_op) {
-  // Use {Load} instead of {ProtectedLoad}.
+  // Use {Load} instead of {TrappingLoad}.
   FLAG_SCOPE(wasm_enforce_bounds_checks);
   WasmRunner<uint32_t> r(execution_tier);
   r.builder().AddMemoryElems<int64_t>(kWasmPageSize / sizeof(int64_t));
@@ -640,7 +670,7 @@ WASM_EXEC_TEST(AtomicExchangeNoConsideredEffectful) {
 }
 
 WASM_EXEC_TEST(AtomicCompareExchangeNoConsideredEffectful) {
-  // Use {Load} instead of {ProtectedLoad}.
+  // Use {Load} instead of {TrappingLoad}.
   FLAG_SCOPE(wasm_enforce_bounds_checks);
   WasmRunner<uint32_t> r(execution_tier);
   r.builder().AddMemoryElems<uint64_t>(kWasmPageSize / sizeof(uint64_t));

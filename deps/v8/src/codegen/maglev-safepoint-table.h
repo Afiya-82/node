@@ -27,12 +27,10 @@ class MaglevSafepointEntry : public SafepointEntryBase {
   MaglevSafepointEntry() = default;
 
   MaglevSafepointEntry(int pc, int deopt_index, uint32_t num_tagged_slots,
-                       uint32_t num_untagged_slots,
                        uint8_t num_extra_spill_slots,
                        uint32_t tagged_register_indexes, int trampoline_pc)
       : SafepointEntryBase(pc, deopt_index, trampoline_pc),
         num_tagged_slots_(num_tagged_slots),
-        num_untagged_slots_(num_untagged_slots),
         num_extra_spill_slots_(num_extra_spill_slots),
         tagged_register_indexes_(tagged_register_indexes) {
     DCHECK(is_initialized());
@@ -41,13 +39,11 @@ class MaglevSafepointEntry : public SafepointEntryBase {
   bool operator==(const MaglevSafepointEntry& other) const {
     return this->SafepointEntryBase::operator==(other) &&
            num_tagged_slots_ == other.num_tagged_slots_ &&
-           num_untagged_slots_ == other.num_untagged_slots_ &&
            num_extra_spill_slots_ == other.num_extra_spill_slots_ &&
            tagged_register_indexes_ == other.tagged_register_indexes_;
   }
 
   uint32_t num_tagged_slots() const { return num_tagged_slots_; }
-  uint32_t num_untagged_slots() const { return num_untagged_slots_; }
   uint8_t num_extra_spill_slots() const { return num_extra_spill_slots_; }
   uint32_t tagged_register_indexes() const { return tagged_register_indexes_; }
 
@@ -55,7 +51,6 @@ class MaglevSafepointEntry : public SafepointEntryBase {
 
  private:
   uint32_t num_tagged_slots_ = 0;
-  uint32_t num_untagged_slots_ = 0;
   uint8_t num_extra_spill_slots_ = 0;
   uint32_t tagged_register_indexes_ = 0;
 };
@@ -76,6 +71,28 @@ class MaglevSafepointTable {
   int byte_size() const { return kHeaderSize + length_ * entry_size(); }
 
   int find_return_pc(int pc_offset);
+
+  uint32_t stack_slots() { return stack_slots_; }
+
+  // Read only the PC offset from entry |index|, without decoding the rest.
+  int GetEntryPc(int index) const {
+    DCHECK_GT(length_, index);
+    Address entry_ptr =
+        safepoint_table_address_ + kHeaderSize + index * entry_size();
+    return read_bytes(&entry_ptr, pc_size());
+  }
+
+  // Read only the trampoline PC from entry |index|.  Requires has_deopt_data().
+  int GetEntryTrampolinePc(int index) const {
+    DCHECK(has_deopt_data());
+    DCHECK_GT(length_, index);
+    Address entry_ptr = safepoint_table_address_ + kHeaderSize +
+                        index * entry_size() + pc_size() + deopt_index_size();
+    int trampoline_pc = read_bytes(&entry_ptr, pc_size()) - 1;
+    DCHECK(trampoline_pc >= 0 ||
+           trampoline_pc == MaglevSafepointEntry::kNoTrampolinePC);
+    return trampoline_pc;
+  }
 
   MaglevSafepointEntry GetEntry(int index) const {
     DCHECK_GT(length_, index);
@@ -102,8 +119,8 @@ class MaglevSafepointTable {
         read_bytes(&entry_ptr, register_indexes_size());
 
     return MaglevSafepointEntry(pc, deopt_index, num_tagged_slots_,
-                                num_untagged_slots_, num_extra_spill_slots,
-                                tagged_register_indexes, trampoline_pc);
+                                num_extra_spill_slots, tagged_register_indexes,
+                                trampoline_pc);
   }
 
   // Returns the entry for the given pc.
@@ -117,15 +134,19 @@ class MaglevSafepointTable {
   MaglevSafepointTable(Isolate* isolate, Address pc, Tagged<GcSafeCode> code);
 
   // Layout information.
-  static constexpr int kLengthOffset = 0;
-  static constexpr int kEntryConfigurationOffset = kLengthOffset + kIntSize;
-  // The number of tagged/untagged slots is constant for the whole code so just
-  // store it in the header.
-  static constexpr int kNumTaggedSlotsOffset =
-      kEntryConfigurationOffset + kUInt32Size;
-  static constexpr int kNumUntaggedSlotsOffset =
-      kNumTaggedSlotsOffset + kUInt32Size;
-  static constexpr int kHeaderSize = kNumUntaggedSlotsOffset + kUInt32Size;
+#define FIELD_LIST(V)                                                      \
+  V(kStackSlotsOffset, sizeof(SafepointTableStackSlotsField_t))            \
+  V(kLengthOffset, kIntSize)                                               \
+  V(kEntryConfigurationOffset, kUInt32Size)                                \
+  /* The number of tagged/untagged slots is constant for the whole code so \
+     just store it in the header. */                                       \
+  V(kNumTaggedSlotsOffset, kUInt32Size)                                    \
+  V(kHeaderSize, 0)
+
+  DEFINE_FIELD_OFFSET_CONSTANTS(0, FIELD_LIST)
+#undef FIELD_LIST
+
+  static_assert(kStackSlotsOffset == kSafepointTableStackSlotsOffset);
 
   using HasDeoptDataField = base::BitField<bool, 0, 1>;
   using RegisterIndexesSizeField = HasDeoptDataField::Next<int, 3>;
@@ -167,16 +188,34 @@ class MaglevSafepointTable {
     return result;
   }
 
+  // Binary search for an exact pc offset match.  Returns the index of the
+  // matching entry, or -1 if not found.
+  V8_INLINE int BinarySearchPc(int pc_offset) const {
+    int lo = 0, hi = length_;
+    while (lo < hi) {
+      int mid = lo + (hi - lo) / 2;
+      int mid_pc = GetEntryPc(mid);
+      if (mid_pc < pc_offset) {
+        lo = mid + 1;
+      } else if (mid_pc > pc_offset) {
+        hi = mid;
+      } else {
+        return mid;
+      }
+    }
+    return -1;
+  }
+
   DISALLOW_GARBAGE_COLLECTION(no_gc_)
 
   const Address instruction_start_;
 
   // Safepoint table layout.
   const Address safepoint_table_address_;
+  const SafepointTableStackSlotsField_t stack_slots_;
   const int length_;
   const uint32_t entry_configuration_;
   const uint32_t num_tagged_slots_;
-  const uint32_t num_untagged_slots_;
 
   friend class MaglevSafepointTableBuilder;
   friend class MaglevSafepointEntry;
@@ -194,11 +233,8 @@ class MaglevSafepointTableBuilder : public SafepointTableBuilderBase {
   };
 
  public:
-  explicit MaglevSafepointTableBuilder(Zone* zone, uint32_t num_tagged_slots,
-                                       uint32_t num_untagged_slots)
-      : num_tagged_slots_(num_tagged_slots),
-        num_untagged_slots_(num_untagged_slots),
-        entries_(zone) {}
+  explicit MaglevSafepointTableBuilder(Zone* zone, uint32_t num_tagged_slots)
+      : num_tagged_slots_(num_tagged_slots), entries_(zone) {}
 
   MaglevSafepointTableBuilder(const MaglevSafepointTableBuilder&) = delete;
   MaglevSafepointTableBuilder& operator=(const MaglevSafepointTableBuilder&) =
@@ -225,7 +261,7 @@ class MaglevSafepointTableBuilder : public SafepointTableBuilderBase {
   Safepoint DefineSafepoint(Assembler* assembler);
 
   // Emit the safepoint table after the body.
-  V8_EXPORT_PRIVATE void Emit(Assembler* assembler);
+  V8_EXPORT_PRIVATE void Emit(Assembler* assembler, int stack_slots);
 
   // Find the Deoptimization Info with pc offset {pc} and update its
   // trampoline field. Calling this function ensures that the safepoint
@@ -236,7 +272,6 @@ class MaglevSafepointTableBuilder : public SafepointTableBuilderBase {
 
  private:
   const uint32_t num_tagged_slots_;
-  const uint32_t num_untagged_slots_;
   ZoneChunkList<EntryBuilder> entries_;
 };
 

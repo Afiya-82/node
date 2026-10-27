@@ -25,11 +25,11 @@ namespace internal {
 class CodeAddressMap : public CodeEventLogger {
  public:
   explicit CodeAddressMap(Isolate* isolate) : CodeEventLogger(isolate) {
-    isolate->v8_file_logger()->AddLogEventListener(this);
+    CHECK(isolate->logger()->AddListener(this));
   }
 
   ~CodeAddressMap() override {
-    isolate_->v8_file_logger()->RemoveLogEventListener(this);
+    CHECK(isolate_->logger()->RemoveListener(this));
   }
 
   void CodeMoveEvent(Tagged<InstructionStream> from,
@@ -41,8 +41,8 @@ class CodeAddressMap : public CodeEventLogger {
     address_to_name_map_.Move(from.address(), to.address());
   }
 
-  void CodeDisableOptEvent(Handle<AbstractCode> code,
-                           Handle<SharedFunctionInfo> shared) override {}
+  void CodeDisableOptEvent(DirectHandle<AbstractCode> code,
+                           DirectHandle<SharedFunctionInfo> shared) override {}
 
   const char* Lookup(Address address) {
     return address_to_name_map_.Lookup(address);
@@ -62,7 +62,7 @@ class CodeAddressMap : public CodeEventLogger {
       }
     }
 
-    void Insert(Address code_address, const char* name, int name_size) {
+    void Insert(Address code_address, const char* name, size_t name_size) {
       base::HashMap::Entry* entry = FindOrCreateEntry(code_address);
       if (entry->value == nullptr) {
         entry->value = CopyName(name, name_size);
@@ -95,9 +95,9 @@ class CodeAddressMap : public CodeEventLogger {
     }
 
    private:
-    static char* CopyName(const char* name, int name_size) {
+    static char* CopyName(const char* name, size_t name_size) {
       char* result = NewArray<char>(name_size + 1);
-      for (int i = 0; i < name_size; ++i) {
+      for (size_t i = 0; i < name_size; ++i) {
         char c = name[i];
         if (c == '\0') c = ' ';
         result[i] = c;
@@ -117,22 +117,22 @@ class CodeAddressMap : public CodeEventLogger {
     }
 
     void RemoveEntry(base::HashMap::Entry* entry) {
-      impl_.Remove(entry->key, entry->hash);
+      impl_.Remove(entry->key, entry->hash());
     }
 
     base::HashMap impl_;
   };
 
   void LogRecordedBuffer(Tagged<AbstractCode> code,
-                         MaybeHandle<SharedFunctionInfo>, const char* name,
-                         int length) override {
+                         MaybeDirectHandle<SharedFunctionInfo>,
+                         const char* name, size_t length) override {
     DisallowGarbageCollection no_gc;
     address_to_name_map_.Insert(code.address(), name, length);
   }
 
 #if V8_ENABLE_WEBASSEMBLY
   void LogRecordedBuffer(const wasm::WasmCode* code, const char* name,
-                         int length) override {
+                         size_t length) override {
     UNREACHABLE();
   }
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -157,7 +157,7 @@ class ObjectCacheIndexMap {
     *index_out = *find_result.entry;
     return find_result.already_exists;
   }
-  bool LookupOrInsert(Handle<HeapObject> obj, int* index_out) {
+  bool LookupOrInsert(DirectHandle<HeapObject> obj, int* index_out) {
     return LookupOrInsert(*obj, index_out);
   }
 
@@ -170,7 +170,7 @@ class ObjectCacheIndexMap {
     return true;
   }
 
-  Handle<FixedArray> Values(Isolate* isolate);
+  DirectHandle<FixedArray> Values(Isolate* isolate);
 
   int size() const { return next_index_; }
 
@@ -188,21 +188,11 @@ class Serializer : public SerializerDeserializer {
 
   const std::vector<uint8_t>* Payload() const { return sink_.data(); }
 
-  bool ReferenceMapContains(Handle<HeapObject> o) {
+  bool ReferenceMapContains(DirectHandle<HeapObject> o) {
     return reference_map()->LookupReference(o) != nullptr;
   }
 
   Isolate* isolate() const { return isolate_; }
-
-  // The pointer compression cage base value used for decompression of all
-  // tagged values except references to InstructionStream objects.
-  PtrComprCageBase cage_base() const {
-#if V8_COMPRESS_POINTERS
-    return cage_base_;
-#else
-    return PtrComprCageBase{};
-#endif  // V8_COMPRESS_POINTERS
-  }
 
   int TotalAllocationSize() const;
 
@@ -249,7 +239,7 @@ class Serializer : public SerializerDeserializer {
                         SerializerReference reference);
   void PutAttachedReference(SerializerReference reference);
   void PutNextChunk(SnapshotSpace space);
-  void PutRepeat(int repeat_count);
+  void PutRepeatRoot(int repeat_count, RootIndex root_index);
 
   // Emit a marker noting that this slot is a forward reference to the an
   // object which has not yet been serialized.
@@ -298,7 +288,7 @@ class Serializer : public SerializerDeserializer {
     deferred_objects_.Push(obj);
   }
 
-  // Register that the the given object shouldn't be immediately serialized, but
+  // Register that the given object shouldn't be immediately serialized, but
   // will be serialized later and any references to it should be pending forward
   // references.
   void RegisterObjectIsPending(Tagged<HeapObject> obj);
@@ -311,7 +301,7 @@ class Serializer : public SerializerDeserializer {
   void CountAllocation(Tagged<Map> map, int size, SnapshotSpace space);
 
 #ifdef DEBUG
-  void PushStack(Handle<HeapObject> o) { stack_.Push(*o); }
+  void PushStack(DirectHandle<HeapObject> o) { stack_.Push(*o); }
   void PopStack();
   void PrintStack();
   void PrintStack(std::ostream&);
@@ -332,6 +322,9 @@ class Serializer : public SerializerDeserializer {
   bool reconstruct_read_only_and_shared_object_caches_for_testing() const {
     return (flags_ &
             Snapshot::kReconstructReadOnlyAndSharedObjectCachesForTesting) != 0;
+  }
+  bool allow_serializing_all_trusted_objects() const {
+    return (flags_ & Snapshot::kAllowSerializingAllTrustedObjects) != 0;
   }
 
   bool deferred_objects_empty() { return deferred_objects_.size() == 0; }
@@ -392,9 +385,6 @@ class Serializer : public SerializerDeserializer {
   DISALLOW_GARBAGE_COLLECTION(no_gc_)
 
   Isolate* isolate_;
-#if V8_COMPRESS_POINTERS
-  const PtrComprCageBase cage_base_;
-#endif  // V8_COMPRESS_POINTERS
   HotObjectsList hot_objects_;
   SerializerReferenceMap reference_map_;
   ExternalReferenceEncoder external_reference_encoder_;
@@ -404,6 +394,9 @@ class Serializer : public SerializerDeserializer {
   GlobalHandleVector<HeapObject>
       deferred_objects_;  // To handle stack overflow.
   int num_back_refs_ = 0;
+
+  // Used to provide deterministic IDs to the serialized dispatch handles.
+  std::unordered_map<JSDispatchHandle, uint32_t> dispatch_handle_map_;
 
   // Objects which have started being serialized, but haven't yet been allocated
   // with the allocator, are considered "pending". References to them don't have
@@ -487,10 +480,20 @@ class Serializer::ObjectSerializer : public ObjectVisitor {
   void VisitOffHeapTarget(Tagged<InstructionStream> host,
                           RelocInfo* target) override;
 
-  void VisitExternalPointer(Tagged<HeapObject> host, ExternalPointerSlot slot,
-                            ExternalPointerTag tag) override;
+  void VisitExternalPointer(Tagged<HeapObject> host,
+                            ExternalPointerSlot slot) override;
   void VisitIndirectPointer(Tagged<HeapObject> host, IndirectPointerSlot slot,
                             IndirectPointerMode mode) override;
+  void VisitTrustedPointerTableEntry(Tagged<HeapObject> host,
+                                     IndirectPointerSlot slot) override;
+  void VisitProtectedPointer(Tagged<TrustedObject> host,
+                             ProtectedPointerSlot slot) override;
+  void VisitProtectedPointer(Tagged<TrustedObject> host,
+                             ProtectedMaybeObjectSlot slot) override;
+  void VisitCppHeapPointer(Tagged<HeapObject> host,
+                           CppHeapPointerSlot slot) override;
+  void VisitJSDispatchTableEntry(Tagged<HeapObject> host,
+                                 JSDispatchHandle handle) override;
 
   Isolate* isolate() { return isolate_; }
 
@@ -507,6 +510,7 @@ class Serializer::ObjectSerializer : public ObjectVisitor {
                                  Maybe<uint32_t> max_byte_length);
   void SerializeJSTypedArray();
   void SerializeJSArrayBuffer();
+  void SerializeNativeContext();
   void SerializeExternalString();
   void SerializeExternalStringAsSequentialString();
 

@@ -4,13 +4,13 @@
 
 #include "src/compiler/turboshaft/use-map.h"
 
-#include "src/compiler/turboshaft/graph.h"
-
 namespace v8::internal::compiler::turboshaft {
 
-UseMap::UseMap(const Graph& graph, Zone* zone)
-    : table_(graph.op_id_count(), zone), uses_(zone), saturated_uses_(zone) {
-  std::vector<std::pair<OpIndex, OpIndex>> delayed_phi_uses;
+UseMap::UseMap(const Graph& graph, Zone* zone, FunctionType filter)
+    : table_(graph.op_id_count(), zone, &graph),
+      uses_(zone),
+      saturated_uses_(zone) {
+  ZoneVector<std::pair<OpIndex, OpIndex>> delayed_phi_uses(zone);
 
   // We preallocate for 2 uses per operation.
   uses_.reserve(graph.op_id_count() * 2);
@@ -35,17 +35,18 @@ UseMap::UseMap(const Graph& graph, Zone* zone)
         saturated_uses_.back().reserve(std::numeric_limits<uint8_t>::max());
       } else {
         table_[op_index].offset = offset;
-        offset += op.saturated_use_count.Get();
+        offset += op.saturated_use_count.GetUnsaturated();
         uses_.resize(offset);
       }
 
+      if (filter(graph, op, zone)) continue;
+
       if (block.IsLoop()) {
-        if (op.Is<PhiOp>()) {
-          DCHECK_EQ(op.input_count, 2);
-          DCHECK_EQ(PhiOp::kLoopPhiBackEdgeIndex, 1);
-          AddUse(&graph, op.input(0), op_index);
+        if (const PhiOp* phi = op.TryCast<PhiOp>()) {
+          DCHECK_EQ(phi->input_count, PhiOp::kLoopPhiInputCount);
+          AddUse(&graph, phi->forward_edge(), op_index);
           // Delay back edge of loop Phis.
-          delayed_phi_uses.emplace_back(op.input(1), op_index);
+          delayed_phi_uses.emplace_back(phi->back_edge(), op_index);
           continue;
         }
       }
@@ -81,7 +82,8 @@ void UseMap::AddUse(const Graph* graph, OpIndex node, OpIndex use) {
   uint32_t& input_count = table_[node].count;
   DCHECK_NE(input_offset, 0);
   if (V8_LIKELY(input_offset > 0)) {
-    DCHECK_LT(input_count, graph->Get(node).saturated_use_count.Get());
+    DCHECK_LT(input_count,
+              graph->Get(node).saturated_use_count.GetMaybeSaturated());
     DCHECK(!uses_[input_offset + input_count].valid());
     uses_[input_offset + input_count] = use;
   } else {

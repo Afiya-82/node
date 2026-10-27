@@ -11,8 +11,8 @@ class Preparation(Step):
   MESSAGE = "Preparation."
 
   def RunStep(self):
-    self.Git("fetch origin +refs/heads/*:refs/heads/*")
     self.GitCheckout("origin/main")
+    self.Git("fetch origin +refs/heads/*:refs/heads/*")
     self.DeleteBranch("work-branch")
 
 
@@ -118,7 +118,7 @@ class EnableMergeWatchlist(Step):
   def RunStep(self):
     old_watchlist_content = FileToText(os.path.join(self.default_cwd,
                                                     WATCHLISTS_FILE))
-    new_watchlist_content = re.sub("(# 'v8-merges@googlegroups\.com',)",
+    new_watchlist_content = re.sub(r"(# 'v8-merges@googlegroups\.com',)",
                                    "'v8-merges@googlegroups.com',",
                                    old_watchlist_content)
     TextToFile(new_watchlist_content, os.path.join(self.default_cwd,

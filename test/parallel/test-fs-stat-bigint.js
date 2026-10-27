@@ -78,6 +78,12 @@ function verifyStats(bigintStats, numStats, allowableDelta) {
         `Number version ${key} = ${msFromNum}, ` +
         `BigInt version ${nsKey} = ${nsFromBigInt}n` +
         ` = ${msFromBigIntNs}ms, Allowable delta = ${allowableDelta}`);
+    } else if (key === 'blocks') {
+      // Some file systems (e.g. ZFS on SmartOS) update the block count of a
+      // freshly written file asynchronously, so it can change between the
+      // two stat() calls.
+      assert.strictEqual(typeof bigintStats[key], 'bigint');
+      assert(bigintStats[key] >= 0n);
     } else if (Number.isSafeInteger(val)) {
       assert.strictEqual(
         bigintStats[key], BigInt(val),
@@ -148,7 +154,7 @@ if (!common.isWindows) {
     { code: 'EBADF' });
 }
 
-const runCallbackTest = (func, arg, done) => {
+const runCallbackTest = common.mustCall((func, arg, done) => {
   const startTime = process.hrtime.bigint();
   func(arg, common.mustNotMutateObjectDeep({ bigint: true }), common.mustCall((err, bigintStats) => {
     func(arg, common.mustCall((err, numStats) => {
@@ -160,7 +166,7 @@ const runCallbackTest = (func, arg, done) => {
       }
     }));
   }));
-};
+}, common.isWindows ? 2 : 3);
 
 {
   const filename = getFilename();
@@ -212,3 +218,36 @@ if (!common.isWindows) {
   verifyStats(bigintStats, numStats, allowableDelta);
   await handle.close();
 })().then(common.mustCall());
+
+{
+  // These two tests have an equivalent in ./test-fs-stat.js
+
+  // BigIntStats Date properties can be set before reading them
+  fs.stat(__filename, { bigint: true }, common.mustSucceed((s) => {
+    s.atime = 2;
+    s.mtime = 3;
+    s.ctime = 4;
+    s.birthtime = 5;
+
+    assert.strictEqual(s.atime, 2);
+    assert.strictEqual(s.mtime, 3);
+    assert.strictEqual(s.ctime, 4);
+    assert.strictEqual(s.birthtime, 5);
+  }));
+
+  // BigIntStats Date properties can be set after reading them
+  fs.stat(__filename, { bigint: true }, common.mustSucceed((s) => {
+    // eslint-disable-next-line no-unused-expressions
+    s.atime, s.mtime, s.ctime, s.birthtime;
+
+    s.atime = 2;
+    s.mtime = 3;
+    s.ctime = 4;
+    s.birthtime = 5;
+
+    assert.strictEqual(s.atime, 2);
+    assert.strictEqual(s.mtime, 3);
+    assert.strictEqual(s.ctime, 4);
+    assert.strictEqual(s.birthtime, 5);
+  }));
+}

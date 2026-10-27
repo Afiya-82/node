@@ -9,13 +9,14 @@ const kMaxIntPtr: constexpr IntegerLiteral
 const kMinIntPtr: constexpr IntegerLiteral
     generates 'IntegerLiteral(ca_.Is64() ? 0x8000000000000000 : 0x80000000)';
 
-@export
 @abstract
-class TurbofanType extends HeapObject {}
+@cppObjectLayoutDefinition
+extern class TurbofanType extends HeapObject {}
 
 // TurbofanBitsetType is 64 bit.
-// We use two separate 32 bit bitsets in Torque, due to limitted support
+// We use two separate 32 bit bitsets in Torque, due to limited support
 // of 64 bit bitsets.
+@cppScope('TurbofanTypeLowBits')
 bitfield struct TurbofanTypeLowBits extends uint32 {
   _unused_padding_field_1: bool: 1 bit;
   other_unsigned31: bool: 1 bit;
@@ -51,37 +52,39 @@ bitfield struct TurbofanTypeLowBits extends uint32 {
   sandboxed_pointer: bool: 1 bit;
 }
 
+@cppScope('TurbofanTypeHighBits')
 bitfield struct TurbofanTypeHighBits extends uint32 {
   machine: bool: 1 bit;
-  the_hole: bool: 1 bit;
-  property_cell_hole: bool: 1 bit;
+  hole: bool: 1 bit;
+  string_wrapper: bool: 1 bit;
+  typed_array: bool: 1 bit;
 }
 
-@export
-class TurbofanBitsetType extends TurbofanType {
+@cppObjectLayoutDefinition
+extern class TurbofanBitsetType extends TurbofanType {
   bitset_low: TurbofanTypeLowBits;
   bitset_high: TurbofanTypeHighBits;
 }
 
-@export
-class TurbofanUnionType extends TurbofanType {
+@cppObjectLayoutDefinition
+extern class TurbofanUnionType extends TurbofanType {
   type1: TurbofanType;
   type2: TurbofanType;
 }
 
-@export
-class TurbofanRangeType extends TurbofanType {
+@cppObjectLayoutDefinition
+extern class TurbofanRangeType extends TurbofanType {
   min: float64;
   max: float64;
 }
 
-@export
-class TurbofanHeapConstantType extends TurbofanType {
+@cppObjectLayoutDefinition
+extern class TurbofanHeapConstantType extends TurbofanType {
   constant: HeapObject;
 }
 
-@export
-class TurbofanOtherNumberConstantType extends TurbofanType {
+@cppObjectLayoutDefinition
+extern class TurbofanOtherNumberConstantType extends TurbofanType {
   constant: float64;
 }
 
@@ -154,8 +157,8 @@ macro TestTurbofanBitsetType(
     case (JSBoundFunction): {
       return bitsetLow.bound_function;
     }
-    case (TheHole): {
-      return bitsetHigh.the_hole;
+    case (Hole): {
+      return bitsetHigh.hole;
     }
     case (JSArray): {
       return bitsetLow.array;
@@ -191,6 +194,16 @@ macro TestTurbofanBitsetType(
             (digit <= Convert<uintptr>(kMinIntPtr) &&
              bitsetLow.negative_big_int_63);
       }
+    }
+    case (wrapper: JSPrimitiveWrapper): {
+      if (Is<String>(wrapper.value)) {
+        return bitsetHigh.string_wrapper;
+      } else {
+        return bitsetLow.other_object;
+      }
+    }
+    case (JSTypedArray): {
+      return bitsetHigh.typed_array;
     }
     case (object: JSObject): {
       if (object.map.IsUndetectable()) {

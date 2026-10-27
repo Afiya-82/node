@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --experimental-wasm-multi-memory
 
 d8.file.execute('test/mjsunit/wasm/wasm-module-builder.js');
 
@@ -14,7 +13,7 @@ for (let mem_idx of [mem0_idx, mem1_idx]) {
       .addBody([
         kExprLocalGet, 0,                                   // -
         kExprLocalGet, 1,                                   // -
-        kAtomicPrefix, kExprAtomicNotify, 0x40, mem_idx, 0  // -
+        kAtomicPrefix, kExprAtomicNotify, 0x42, mem_idx, 0  // -
       ])
       .exportFunc();
   builder.addFunction(`wait${mem_idx}`, kSig_i_iii)
@@ -26,7 +25,7 @@ for (let mem_idx of [mem0_idx, mem1_idx]) {
         kExprI64UConvertI32,                                 // -
         ...wasmI64Const(1e6),                                // -
         kExprI64Mul,                                         // -
-        kAtomicPrefix, kExprI32AtomicWait, 0x40, mem_idx, 0  // -
+        kAtomicPrefix, kExprI32AtomicWait, 0x42, mem_idx, 0  // -
       ])
       .exportFunc();
 }
@@ -37,7 +36,10 @@ const mem1 = new WebAssembly.Memory({initial: 2, maximum: 2, shared: true});
 
 const mem0_value = 0;
 const mem1_value = 1;
-new Uint32Array(mem1.buffer).fill(mem1_value);
+const mem1_view = new DataView(mem1.buffer);
+for (let i = 0; i < mem1.buffer.byteLength; i += 4) {
+  mem1_view.setUint32(i, mem1_value, true);
+}
 
 const imports = {
   imp: {mem0: mem0, mem1: mem1}
@@ -64,7 +66,7 @@ const k10s = 10000;
   print(arguments.callee.name);
   function workerCode() {
     instance = undefined;
-    onmessage = function(msg) {
+    onmessage = function({data:msg}) {
       if (!instance) {
         instance = new WebAssembly.Instance(msg.module, msg.imports);
         postMessage('instantiated');

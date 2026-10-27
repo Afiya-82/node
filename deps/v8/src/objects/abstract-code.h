@@ -23,44 +23,52 @@ class Code;
 // profiling. Perhaps methods should be specialized instead of this wrapper
 // class?
 class AbstractCode : public HeapObject {
- public:
-  int SourcePosition(PtrComprCageBase cage_base, int offset);
-  int SourceStatementPosition(PtrComprCageBase cage_base, int offset);
+  V8_IT_NO_AUTO_CHECKER;
 
-  inline Address InstructionStart(PtrComprCageBase cage_base);
-  inline Address InstructionEnd(PtrComprCageBase cage_base);
-  inline int InstructionSize(PtrComprCageBase cage_base);
+ public:
+  int SourcePosition(Isolate* isolate, int offset);
+  int SourceStatementPosition(Isolate* isolate, int offset);
+
+  inline Address InstructionStart();
+  inline Address InstructionEnd();
+  inline int InstructionSize();
 
   // Return the source position table for interpreter code.
-  inline Tagged<ByteArray> SourcePositionTable(Isolate* isolate,
-                                               Tagged<SharedFunctionInfo> sfi);
+  inline Tagged<TrustedByteArray> SourcePositionTable(
+      Isolate* isolate, Tagged<SharedFunctionInfo> sfi);
 
-  void DropStackFrameCache(PtrComprCageBase cage_base);
 
   // Returns the size of instructions and the metadata.
-  inline int SizeIncludingMetadata(PtrComprCageBase cage_base);
+  inline int SizeIncludingMetadata();
 
   // Returns true if pc is inside this object's instructions.
   inline bool contains(Isolate* isolate, Address pc);
 
   // Returns the kind of the code.
-  inline CodeKind kind(PtrComprCageBase cage_base);
+  inline CodeKind kind();
 
-  inline Builtin builtin_id(PtrComprCageBase cage_base);
+  inline Builtin builtin_id();
 
-  inline bool has_instruction_stream(PtrComprCageBase cage_base);
+  inline bool has_instruction_stream();
 
-  DECL_CAST(AbstractCode)
+  bool is_context_specialized();
+  BytecodeOffset osr_offset();
 
   inline Tagged<Code> GetCode();
   inline Tagged<BytecodeArray> GetBytecodeArray();
-
- private:
-  inline Tagged<ByteArray> SourcePositionTableInternal(
-      PtrComprCageBase cage_base);
-
-  OBJECT_CONSTRUCTORS(AbstractCode, HeapObject);
+  inline Tagged<Union<Code, BytecodeArray>> ToUnionType();
 };
+
+// Currently we must use full-pointer comparisons (instead of
+// compressed-pointer comparisons) when comparing AbstractCode. This is because
+// AbstractCode is either a Code or a BytecodeArray, and the latter lives in
+// trusted space (outside of the main pointer compression cage) while the
+// former still lives inside of the sandbox.
+static_assert(!kAllCodeObjectsLiveInTrustedSpace);
+constexpr bool operator==(const Tagged<AbstractCode> lhs,
+                          const Tagged<AbstractCode> rhs) {
+  return lhs.ptr() == rhs.ptr();
+}
 
 }  // namespace internal
 }  // namespace v8

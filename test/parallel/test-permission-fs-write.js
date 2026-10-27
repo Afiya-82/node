@@ -1,10 +1,16 @@
-// Flags: --experimental-permission --allow-fs-read=* --allow-child-process
+// Flags: --permission --allow-fs-read=* --allow-child-process --allow-env=NODE_TEST_DIR,TEST_*
 'use strict';
 
 const common = require('../common');
-common.skipIfWorker();
-if (!common.hasCrypto)
+const { isMainThread } = require('worker_threads');
+
+if (!isMainThread) {
+  common.skip('This test only works on a main thread');
+}
+
+if (!common.hasCrypto) {
   common.skip('no crypto');
+}
 
 const assert = require('assert');
 const path = require('path');
@@ -24,7 +30,8 @@ const file = fixtures.path('permission', 'fs-write.js');
   const { status, stderr } = spawnSync(
     process.execPath,
     [
-      '--experimental-permission',
+      '--permission',
+      '--allow-env=ALLOWEDFILE,ALLOWEDFOLDER,BLOCKEDFILE,BLOCKEDFOLDER,RELATIVEBLOCKEDFILE,RELATIVEBLOCKEDFOLDER',
       '--allow-fs-read=*',
       `--allow-fs-write=${regularFile}`, `--allow-fs-write=${commonPath}`,
       file,

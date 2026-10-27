@@ -31,7 +31,7 @@ const LOOPBACK = { IPv4: '127.0.0.1', IPv6: '::1' };
 const ANY = { IPv4: '0.0.0.0', IPv6: '::' };
 const FAM = 'IPv4';
 
-// Windows wont bind on multicasts so its filtering is by port.
+// Windows won't bind on multicasts so its filtering is by port.
 const PORTS = {};
 for (let i = 0; i < MULTICASTS[FAM].length; i++) {
   PORTS[MULTICASTS[FAM][i]] = common.PORT + (common.isWindows ? i : 0);
@@ -144,7 +144,7 @@ if (process.argv[2] !== 'child') {
       }
     });
 
-    worker.on('message', (msg) => {
+    worker.on('message', common.mustCallAtLeast((msg) => {
       if (msg.listening) {
         listening += 1;
 
@@ -168,7 +168,7 @@ if (process.argv[2] !== 'child') {
                         'required number of ' +
                         'messages. Will now compare.');
 
-          Object.keys(workers).forEach((pid) => {
+          for (const pid of Object.keys(workers)) {
             const worker = workers[pid];
 
             let count = 0;
@@ -189,14 +189,14 @@ if (process.argv[2] !== 'child') {
             assert.strictEqual(count, worker.messagesNeeded.length,
                                'A worker received ' +
                                'an invalid multicast message');
-          });
+          }
 
           clearTimeout(timer);
           console.error('[PARENT] Success');
           killSubprocesses(workers);
         }
       }
-    });
+    }));
   }
 
   const sendSocket = dgram.createSocket({
@@ -234,14 +234,13 @@ if (process.argv[2] !== 'child') {
       buf.length,
       PORTS[msg.mcast],
       msg.mcast,
-      (err) => {
-        assert.ifError(err);
+      common.mustSucceed(() => {
         console.error('[PARENT] sent %s to %s:%s',
                       util.inspect(buf.toString()),
                       msg.mcast, PORTS[msg.mcast]);
 
         process.nextTick(sendSocket.sendNext);
-      },
+      }),
     );
   };
 }

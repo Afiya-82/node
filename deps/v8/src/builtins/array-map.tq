@@ -100,18 +100,21 @@ struct Vector {
 
   macro CreateJSArray(implicit context: Context)(validLength: Smi):
       JSArray {
-    const length: Smi = this.fixedArray.length;
-    dcheck(validLength <= length);
+    const length: intptr = this.fixedArray.length_intptr;
+    dcheck(Convert<intptr>(validLength) <= length);
     let kind: ElementsKind = ElementsKind::PACKED_SMI_ELEMENTS;
     if (!this.onlySmis) {
       if (this.onlyNumbers) {
         kind = ElementsKind::PACKED_DOUBLE_ELEMENTS;
+      } else if (this.onlyNumbersAndUndefined) {
+        dcheck(kEnableUndefinedDouble);
+        kind = ElementsKind::HOLEY_DOUBLE_ELEMENTS;
       } else {
         kind = ElementsKind::PACKED_ELEMENTS;
       }
     }
 
-    if (this.skippedElements || validLength < length) {
+    if (this.skippedElements || Convert<intptr>(validLength) < length) {
       // We also need to create a holey output array if we are
       // bailing out of the fast path partway through the array.
       // This is indicated by {validLength} < {length}.
@@ -128,15 +131,30 @@ struct Vector {
       // First, initialize the elements field before allocation to prevent
       // heap corruption.
       const elements: FixedDoubleArray =
-          AllocateFixedDoubleArrayWithHoles(SmiUntag(length));
+          AllocateFixedDoubleArrayWithHoles(length);
       a = NewJSArray(map, this.fixedArray);
       for (let i: Smi = 0; i < validLength; i++) {
-        typeswitch (
-            UnsafeCast<(Number | TheHole)>(this.fixedArray.objects[i])) {
-          case (n: Number): {
-            elements.floats[i] = Convert<float64_or_hole>(n);
+        @if(V8_ENABLE_UNDEFINED_DOUBLE) {
+          typeswitch (UnsafeCast<(Number | Undefined | TheHole)>(
+              this.fixedArray.objects[i])) {
+            case (n: Number): {
+              elements.values[i] = Convert<float64_or_undefined_or_hole>(n);
+            }
+            case (Undefined): {
+              elements.values[i] = kDoubleUndefined;
+            }
+            case (TheHole): {
+            }
           }
-          case (TheHole): {
+        }
+        @ifnot(V8_ENABLE_UNDEFINED_DOUBLE) {
+          typeswitch (
+              UnsafeCast<(Number | TheHole)>(this.fixedArray.objects[i])) {
+            case (n: Number): {
+              elements.values[i] = Convert<float64_or_undefined_or_hole>(n);
+            }
+            case (TheHole): {
+            }
           }
         }
       }
@@ -161,18 +179,30 @@ struct Vector {
         this.onlySmis = false;
         this.fixedArray.objects[index] = s;
       }
-      case (s: JSAnyNotNumber): {
+      case (s: Undefined): {
         this.onlySmis = false;
         this.onlyNumbers = false;
+        @ifnot(V8_ENABLE_UNDEFINED_DOUBLE) {
+          // If we are running without undefined doubles, we don't distinguish
+          // undefineds here.
+          this.onlyNumbersAndUndefined = false;
+        }
+        this.fixedArray.objects[index] = s;
+      }
+      case (s: JSAnyNotNumberOrUndefined): {
+        this.onlySmis = false;
+        this.onlyNumbers = false;
+        this.onlyNumbersAndUndefined = false;
         this.fixedArray.objects[index] = s;
       }
     }
   }
 
   fixedArray: FixedArray;
-  onlySmis: bool;         // initially true.
-  onlyNumbers: bool;      // initially true.
-  skippedElements: bool;  // initially false.
+  onlySmis: bool;                 // initially true.
+  onlyNumbers: bool;              // initially true.
+  onlyNumbersAndUndefined: bool;  // initially true.
+  skippedElements: bool;          // initially false.
 }
 
 macro NewVector(implicit context: Context)(length: Smi): Vector {
@@ -183,6 +213,7 @@ macro NewVector(implicit context: Context)(length: Smi): Vector {
     fixedArray,
     onlySmis: true,
     onlyNumbers: true,
+    onlyNumbersAndUndefined: true,
     skippedElements: false
   };
 }
@@ -224,7 +255,7 @@ transitioning macro FastArrayMap(
   return vector.CreateJSArray(len);
 }
 
-// https://tc39.github.io/ecma262/#sec-array.prototype.map
+// https://tc39.es/ecma262/#sec-array.prototype.map
 transitioning javascript builtin ArrayMap(
     js-implicit context: NativeContext, receiver: JSAny)(...arguments): JSAny {
   try {

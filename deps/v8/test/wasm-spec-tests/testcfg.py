@@ -2,44 +2,57 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
-import os
-
 from testrunner.local import testsuite
 from testrunner.objects import testcase
 
+# We use the 'wasm-3.0' branch on the main spec repo, so enable all proposals
+# that were merged into that branch.
+default_flags = []
+
 proposal_flags = [
     {
-        'name': 'js-types',
-        'flags': ['--experimental-wasm-type-reflection']
-    },
-    {
         'name': 'tail-call',
-        'flags': ['--experimental-wasm-return-call']
+        'flags': []
     },
     {
         'name': 'memory64',
-        'flags': ['--experimental-wasm-memory64']
+        'flags': []
     },
     {
         'name': 'extended-const',
-        'flags': ['--experimental-wasm-extended-const']
+        'flags': []
     },
     {
         'name': 'function-references',
-        # Some of these tests need `global.get` to be a constant instruction,
-        # which is part of the GC proposal. We'll ship both proposals at once
-        # anyway, so we might as well enable both for these tests.
-        'flags': [
-            '--experimental-wasm-typed-funcref', '--experimental-wasm-gc'
-        ]
+        'flags': []
     },
     {
         'name': 'gc',
-        'flags': ['--experimental-wasm-gc', '--wasm-final-types']
+        'flags': []
     },
     {
         'name': 'multi-memory',
-        'flags': ['--experimental-wasm-multi-memory']
+        'flags': []
+    },
+    {
+        'name': 'exception-handling',
+        'flags': []
+    },
+    {
+        'name': 'js-promise-integration',
+        'flags': []
+    },
+    {
+        'name': 'stack-switching',
+        'flags': ['--wasm-wasmfx']
+    },
+    {
+        'name': 'custom-descriptors',
+        'flags': ['--wasm-custom-descriptors']
+    },
+    {
+        'name': 'wide-arithmetic',
+        'flags': ['--wasm-wide-arithmetic']
     },
 ]
 
@@ -68,4 +81,4 @@ class TestCase(testcase.D8TestCase):
     for proposal in proposal_flags:
       if f"proposals/{proposal['name']}" in self.name:
         return proposal['flags']
-    return []
+    return default_flags

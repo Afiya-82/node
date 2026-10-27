@@ -5,6 +5,10 @@ const cp = require('child_process');
 const fs = require('fs');
 const { isMainThread } = require('worker_threads');
 
+// A perfetto build names a thread through its track descriptor rather than
+// a thread_name metadata event, and without the `[worker <id>]` prefix.
+common.skipIfPerfettoEnabled();
+
 if (isMainThread) {
   const CODE = 'const { Worker } = require(\'worker_threads\'); ' +
                `new Worker(${JSON.stringify(__filename)})`;
@@ -23,7 +27,7 @@ if (isMainThread) {
       assert(traces.length > 0);
       assert(traces.some((trace) =>
         trace.cat === '__metadata' && trace.name === 'thread_name' &&
-          trace.args.name === '[worker 1]'));
+          trace.args.name === '[worker 1] WorkerThread'));
     }));
   }));
 } else {

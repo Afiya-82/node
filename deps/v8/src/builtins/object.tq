@@ -110,12 +110,14 @@ transitioning builtin CreateObjectWithoutProperties(
         map = UnsafeCast<Map>(objectFunction.prototype_or_initial_map);
         if (prototype != map.prototype) {
           const prototypeInfo = prototype.map.PrototypeInfo() otherwise Runtime;
-          typeswitch (prototypeInfo.object_create_map) {
+          typeswitch (prototypeInfo.derived_maps) {
             case (Undefined): {
               goto Runtime;
             }
-            case (weak_map: Weak<Map>): {
-              map = WeakToStrong(weak_map) otherwise Runtime;
+            case (derived_maps: WeakArrayList): {
+              const theMap = MaybeObjectToStrong(derived_maps.objects[0])
+                  otherwise Runtime;
+              map = UnsafeCast<Map>(theMap);
             }
           }
         }
@@ -170,20 +172,20 @@ transitioning javascript builtin ObjectSetPrototypeOf(
   }
 }
 
-// ES #sec-object.prototype.tostring
+// https://tc39.es/ecma262/#sec-object.prototype.tostring
 transitioning javascript builtin ObjectPrototypeToString(
     js-implicit context: Context, receiver: JSAny)(): String {
   return ObjectToString(context, receiver);
 }
 
-// ES #sec-object.prototype.valueof
+// https://tc39.es/ecma262/#sec-object.prototype.valueof
 transitioning javascript builtin ObjectPrototypeValueOf(
     js-implicit context: Context, receiver: JSAny)(): JSReceiver {
   // 1. Return ? ToObject(this value).
   return ToObject_Inline(context, receiver);
 }
 
-// ES #sec-object.prototype.tolocalestring
+// https://tc39.es/ecma262/#sec-object.prototype.tolocalestring
 transitioning javascript builtin ObjectPrototypeToLocaleString(
     js-implicit context: Context, receiver: JSAny)(): JSAny {
   // 1. Let O be the this value.

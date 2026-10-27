@@ -5,7 +5,10 @@
 #ifndef V8_SNAPSHOT_CODE_SERIALIZER_H_
 #define V8_SNAPSHOT_CODE_SERIALIZER_H_
 
+#include <optional>
+
 #include "src/base/macros.h"
+#include "src/codegen/script-details.h"
 #include "src/snapshot/serializer.h"
 #include "src/snapshot/snapshot-data.h"
 
@@ -49,41 +52,33 @@ class V8_EXPORT_PRIVATE AlignedCachedData {
   int length_;
 };
 
-enum class SerializedCodeSanityCheckResult {
-  // Don't change order/existing values of this enum since it keys into the
-  // `code_cache_reject_reason` histogram. Append-only!
-  kSuccess = 0,
-  kMagicNumberMismatch = 1,
-  kVersionMismatch = 2,
-  kSourceMismatch = 3,
-  kFlagsMismatch = 5,
-  kChecksumMismatch = 6,
-  kInvalidHeader = 7,
-  kLengthMismatch = 8,
-  kReadOnlySnapshotChecksumMismatch = 9,
+typedef v8::ScriptCompiler::CachedData::CompatibilityCheckResult
+    SerializedCodeSanityCheckResult;
 
-  // This should always point at the last real enum value.
-  kLast = kReadOnlySnapshotChecksumMismatch
-};
 // If this fails, update the static_assert AND the code_cache_reject_reason
 // histogram definition.
 static_assert(static_cast<int>(SerializedCodeSanityCheckResult::kLast) == 9);
 
+class CodeSerializer;
+
+struct OffThreadDeserializeData {
+ public:
+  bool HasResult() const { return !maybe_result.is_null(); }
+  DirectHandle<Script> GetOnlyScript(LocalHeap* heap);
+
+ private:
+  friend class CodeSerializer;
+  friend class SerializedCodeData;
+  MaybeIndirectHandle<SharedFunctionInfo> maybe_result;
+  std::vector<IndirectHandle<Script>> scripts;
+  std::unique_ptr<PersistentHandles> persistent_handles;
+  SerializedCodeSanityCheckResult sanity_check_result =
+      SerializedCodeSanityCheckResult::kSuccess;
+  std::optional<SerializedCodeSanityCheckResult> source_sanity_check_result;
+};
+
 class CodeSerializer : public Serializer {
  public:
-  struct OffThreadDeserializeData {
-   public:
-    bool HasResult() const { return !maybe_result.is_null(); }
-    Handle<Script> GetOnlyScript(LocalHeap* heap);
-
-   private:
-    friend class CodeSerializer;
-    MaybeHandle<SharedFunctionInfo> maybe_result;
-    std::vector<Handle<Script>> scripts;
-    std::unique_ptr<PersistentHandles> persistent_handles;
-    SerializedCodeSanityCheckResult sanity_check_result;
-  };
-
   CodeSerializer(const CodeSerializer&) = delete;
   CodeSerializer& operator=(const CodeSerializer&) = delete;
   V8_EXPORT_PRIVATE static ScriptCompiler::CachedData* Serialize(
@@ -92,20 +87,25 @@ class CodeSerializer : public Serializer {
   AlignedCachedData* SerializeSharedFunctionInfo(
       Handle<SharedFunctionInfo> info);
 
-  V8_WARN_UNUSED_RESULT static MaybeHandle<SharedFunctionInfo> Deserialize(
-      Isolate* isolate, AlignedCachedData* cached_data, Handle<String> source,
-      ScriptOriginOptions origin_options,
-      MaybeHandle<Script> maybe_cached_script = {});
+  V8_WARN_UNUSED_RESULT static MaybeDirectHandle<SharedFunctionInfo>
+  Deserialize(Isolate* isolate, AlignedCachedData* cached_data,
+              DirectHandle<String> source, const ScriptDetails& script_details,
+              MaybeDirectHandle<Script> maybe_cached_script = {});
 
-  V8_WARN_UNUSED_RESULT static OffThreadDeserializeData
-  StartDeserializeOffThread(LocalIsolate* isolate,
-                            AlignedCachedData* cached_data);
+  static void StartDeserializeOffThread(LocalIsolate* isolate,
+                                        AlignedCachedData* cached_data,
+                                        OffThreadDeserializeData* data);
 
-  V8_WARN_UNUSED_RESULT static MaybeHandle<SharedFunctionInfo>
+  V8_WARN_UNUSED_RESULT static bool NotifySourceTextAvailable(
+      Isolate* isolate, OffThreadDeserializeData* data,
+      const AlignedCachedData* cached_data, DirectHandle<String> source,
+      const ScriptDetails& script_details);
+
+  V8_WARN_UNUSED_RESULT static MaybeDirectHandle<SharedFunctionInfo>
   FinishOffThreadDeserialize(
       Isolate* isolate, OffThreadDeserializeData&& data,
-      AlignedCachedData* cached_data, Handle<String> source,
-      ScriptOriginOptions origin_options,
+      AlignedCachedData* cached_data, DirectHandle<String> source,
+      const ScriptDetails& script_details,
       BackgroundMergeTask* background_merge_task = nullptr);
 
   uint32_t source_hash() const { return source_hash_; }
@@ -152,7 +152,9 @@ class SerializedCodeData : public SerializedData {
   // FromCachedDataWithoutSource. The rejection result from that call should be
   // passed into this one.
   static SerializedCodeData FromPartiallySanityCheckedCachedData(
-      AlignedCachedData* cached_data, uint32_t expected_source_hash,
+      Isolate* isolate, AlignedCachedData* cached_data,
+      const OffThreadDeserializeData& data, DirectHandle<String> source,
+      const ScriptDetails& script_details,
       SerializedCodeSanityCheckResult* rejection_result);
 
   // Used when producing.
@@ -164,11 +166,13 @@ class SerializedCodeData : public SerializedData {
 
   base::Vector<const uint8_t> Payload() const;
 
-  static uint32_t SourceHash(Handle<String> source,
+  static uint32_t SourceHash(DirectHandle<String> source,
+                             DirectHandle<FixedArray> wrapped_arguments,
                              ScriptOriginOptions origin_options);
 
  private:
-  explicit SerializedCodeData(AlignedCachedData* data);
+  friend class CodeSerializer;
+  explicit SerializedCodeData(const AlignedCachedData* data);
   SerializedCodeData(const uint8_t* data, int size)
       : SerializedData(const_cast<uint8_t*>(data), size) {}
 
@@ -180,6 +184,9 @@ class SerializedCodeData : public SerializedData {
   SerializedCodeSanityCheckResult SanityCheck(
       uint32_t expected_ro_snapshot_checksum,
       uint32_t expected_source_hash) const;
+  SerializedCodeSanityCheckResult SanityCheckJustSource(
+      Isolate* isolate, DirectHandle<String> source,
+      const ScriptDetails& script_details) const;
   SerializedCodeSanityCheckResult SanityCheckJustSource(
       uint32_t expected_source_hash) const;
   SerializedCodeSanityCheckResult SanityCheckWithoutSource(

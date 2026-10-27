@@ -43,11 +43,6 @@
 #ifndef GOOGLETEST_INCLUDE_GTEST_INTERNAL_GTEST_STRING_H_
 #define GOOGLETEST_INCLUDE_GTEST_INTERNAL_GTEST_STRING_H_
 
-#ifdef __BORLANDC__
-// string.h is not guaranteed to provide strcpy on C++ Builder.
-#include <mem.h>
-#endif
-
 #include <string.h>
 
 #include <cstdint>
@@ -60,7 +55,7 @@ namespace testing {
 namespace internal {
 
 // String - an abstract class holding static string utilities.
-class GTEST_API_ String {
+class GTEST_API_ [[nodiscard]] String {
  public:
   // Static utility methods
 
@@ -166,7 +161,7 @@ class GTEST_API_ String {
 
  private:
   String();  // Not meant to be instantiated.
-};           // class String
+};  // class String
 
 // Gets the content of the stringstream's buffer as an std::string.  Each '\0'
 // character in the buffer is replaced with "\\0".

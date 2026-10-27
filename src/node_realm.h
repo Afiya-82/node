@@ -6,6 +6,7 @@
 #include <v8.h>
 #include <unordered_map>
 #include "cleanup_queue.h"
+#include "cppgc_helpers.h"
 #include "env_properties.h"
 #include "memory_tracker.h"
 #include "node_snapshotable.h"
@@ -24,6 +25,39 @@ struct RealmSerializeInfo {
 using BindingDataStore =
     std::array<BaseObjectWeakPtr<BaseObject>,
                static_cast<size_t>(BindingDataType::kBindingDataTypeCount)>;
+
+/**
+ * Owned by a CppgcMixin and linked into its Realm's list until the Realm
+ * cleans up and clears `realm`. The Realm only calls into wrappers the GC
+ * still considers alive (the weak persistent); a collected wrapper whose
+ * destructor runs later sees `realm == nullptr` instead of a freed Realm.
+ */
+class CppgcWrapperListNode {
+ public:
+  inline CppgcWrapperListNode(Realm* realm, CppgcMixin* wrapper);
+
+  Realm* realm;
+  cppgc::WeakPersistent<CppgcMixin> persistent;
+  // Used by ContainerOf in the ListNode implementation for fast manipulation of
+  // CppgcWrapperList.
+  ListNode<CppgcWrapperListNode> wrapper_list_node;
+};
+
+/**
+ * A per-realm list of weak persistent of cppgc wrappers, which implements
+ * iterations that require iterate over cppgc wrappers created by Node.js.
+ */
+class CppgcWrapperList
+    : public ListHead<CppgcWrapperListNode,
+                      &CppgcWrapperListNode::wrapper_list_node>,
+      public MemoryRetainer {
+ public:
+  void Cleanup();
+
+  SET_MEMORY_INFO_NAME(CppgcWrapperList)
+  SET_SELF_SIZE(CppgcWrapperList)
+  void MemoryInfo(MemoryTracker* tracker) const override;
+};
 
 /**
  * node::Realm is a container for a set of JavaScript objects and functions
@@ -71,9 +105,9 @@ class Realm : public MemoryRetainer {
   v8::MaybeLocal<v8::Value> ExecuteBootstrapper(const char* id);
   v8::MaybeLocal<v8::Value> RunBootstrapping();
 
-  inline void AddCleanupHook(CleanupQueue::Callback cb, void* arg);
-  inline void RemoveCleanupHook(CleanupQueue::Callback cb, void* arg);
-  inline bool HasCleanupHooks() const;
+  inline void TrackBaseObject(BaseObject* bo);
+  inline void UntrackBaseObject(BaseObject* bo);
+  inline bool PendingCleanup() const;
   void RunCleanup();
 
   template <typename T>
@@ -86,13 +120,13 @@ class Realm : public MemoryRetainer {
   inline Environment* env() const;
   inline v8::Isolate* isolate() const;
   inline Kind kind() const;
-  virtual v8::Local<v8::Context> context() const;
+  inline virtual v8::Local<v8::Context> context() const;
   inline bool has_run_bootstrapping_code() const;
 
   // Methods created using SetMethod(), SetPrototypeMethod(), etc. inside
   // this scope can access the created T* object using
   // GetBindingData<T>(args) later.
-  template <typename T, typename... Args>
+  template <std::derived_from<BaseObject> T, typename... Args>
   T* AddBindingData(v8::Local<v8::Object> target, Args&&... args);
   template <typename T, typename U>
   static inline T* GetBindingData(const v8::PropertyCallbackInfo<U>& info);
@@ -108,11 +142,13 @@ class Realm : public MemoryRetainer {
   // The BaseObject count is a debugging helper that makes sure that there are
   // no memory leaks caused by BaseObjects staying alive longer than expected
   // (in particular, no circular BaseObjectPtr references).
-  inline void modify_base_object_count(int64_t delta);
   inline int64_t base_object_count() const;
 
   // Base object count created after the bootstrap of the realm.
   inline int64_t base_object_created_after_bootstrap() const;
+
+  inline CppgcWrapperListNode* TrackCppgcWrapper(CppgcMixin* handle);
+  inline CppgcWrapperList* cppgc_wrapper_list() { return &cppgc_wrapper_list_; }
 
 #define V(PropertyName, TypeName)                                              \
   virtual v8::Local<TypeName> PropertyName() const = 0;                        \
@@ -154,10 +190,11 @@ class Realm : public MemoryRetainer {
 
   BindingDataStore binding_data_store_;
 
-  CleanupQueue cleanup_queue_;
+  BaseObjectList base_object_list_;
+  CppgcWrapperList cppgc_wrapper_list_;
 };
 
-class PrincipalRealm : public Realm {
+class PrincipalRealm final : public Realm {
  public:
   PrincipalRealm(Environment* env,
                  v8::Local<v8::Context> context,

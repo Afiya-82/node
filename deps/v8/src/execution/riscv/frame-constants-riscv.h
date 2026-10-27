@@ -7,6 +7,7 @@
 
 #include "src/base/bits.h"
 #include "src/base/macros.h"
+#include "src/codegen/register.h"
 #include "src/execution/frame-constants.h"
 #include "src/wasm/baseline/liftoff-assembler-defs.h"
 
@@ -18,6 +19,11 @@ class EntryFrameConstants : public AllStatic {
   // This is the offset to where JSEntry pushes the current value of
   // Isolate::c_entry_fp onto the stack.
   static constexpr int kNextExitFrameFPOffset = -3 * kSystemPointerSize;
+  // The offsets for storing the FP and PC of fast API calls.
+  static constexpr int kNextFastCallFrameFPOffset =
+      kNextExitFrameFPOffset - kSystemPointerSize;
+  static constexpr int kNextFastCallFramePCOffset =
+      kNextFastCallFrameFPOffset - kSystemPointerSize;
 };
 
 class WasmLiftoffSetupFrameConstants : public TypedFrameConstants {
@@ -29,19 +35,41 @@ class WasmLiftoffSetupFrameConstants : public TypedFrameConstants {
   // linkage_location.h, issue: v8:14035) and resultant compilation errors.
   static constexpr int kNumberOfSavedGpParamRegs = 6;
   static constexpr int kNumberOfSavedFpParamRegs = 8;
-  static constexpr int kNumberOfSavedAllParamRegs =
-      kNumberOfSavedGpParamRegs + kNumberOfSavedFpParamRegs;
+  static constexpr int kNumberOfSavedVpParamRegs = 8;
+  static constexpr int kNumberOfSavedAllParamRegs = kNumberOfSavedGpParamRegs +
+                                                    kNumberOfSavedFpParamRegs +
+                                                    kNumberOfSavedVpParamRegs;
+
+  // The instance is pushed separately from the other saved parameters. It is
+  // the saved register closest to fp at index 0.
   static constexpr int kInstanceSpillOffset =
       TYPED_FRAME_PUSHED_VALUE_OFFSET(0);
+  // We then spill floating-point/vector param regs and finally ra.
+  // Offset computation:
+  // 1 for the instance, and counting each 128bit vector reg as two slots.
+  static_assert(kSimd128Size == 2 * kSystemPointerSize);
+  static constexpr int kCallingPCOffset = TYPED_FRAME_PUSHED_VALUE_OFFSET(
+      1 + kNumberOfSavedGpParamRegs + kNumberOfSavedFpParamRegs +
+      kNumberOfSavedVpParamRegs * 2);
+
+  // The parameters are pushed onto the stack using MacroAssembler::MultiPush;
+  // see src/codegen/riscv/macro-assembler-riscv.cc. That means that the last
+  // parameter is pushed first, so it ends second closest to fp at index 1.
   static constexpr int kParameterSpillsOffset[] = {
-      TYPED_FRAME_PUSHED_VALUE_OFFSET(1), TYPED_FRAME_PUSHED_VALUE_OFFSET(2),
-      TYPED_FRAME_PUSHED_VALUE_OFFSET(3), TYPED_FRAME_PUSHED_VALUE_OFFSET(4),
-      TYPED_FRAME_PUSHED_VALUE_OFFSET(5), TYPED_FRAME_PUSHED_VALUE_OFFSET(6)};
+      TYPED_FRAME_PUSHED_VALUE_OFFSET(6), TYPED_FRAME_PUSHED_VALUE_OFFSET(5),
+      TYPED_FRAME_PUSHED_VALUE_OFFSET(4), TYPED_FRAME_PUSHED_VALUE_OFFSET(3),
+      TYPED_FRAME_PUSHED_VALUE_OFFSET(2), TYPED_FRAME_PUSHED_VALUE_OFFSET(1)};
 
   // SP-relative.
-  static constexpr int kWasmInstanceOffset = 2 * kSystemPointerSize;
+  static constexpr int kWasmInstanceDataOffset = 2 * kSystemPointerSize;
   static constexpr int kDeclaredFunctionIndexOffset = 1 * kSystemPointerSize;
   static constexpr int kNativeModuleOffset = 0;
+};
+
+class WasmLiftoffFrameConstants : public TypedFrameConstants {
+ public:
+  static constexpr int kFeedbackVectorOffset = 3 * kSystemPointerSize;
+  static constexpr int kInstanceDataOffset = 2 * kSystemPointerSize;
 };
 
 // Frame constructed by the {WasmDebugBreak} builtin.

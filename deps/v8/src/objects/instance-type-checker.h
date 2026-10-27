@@ -18,22 +18,34 @@ namespace internal {
 class Map;
 
 // List of object types that have a single unique instance type.
-#define INSTANCE_TYPE_CHECKERS_SINGLE(V)           \
-  TORQUE_INSTANCE_CHECKERS_SINGLE_FULLY_DEFINED(V) \
-  TORQUE_INSTANCE_CHECKERS_SINGLE_ONLY_DECLARED(V) \
-  V(BigInt, BIGINT_TYPE)                           \
+#define INSTANCE_TYPE_CHECKERS_SINGLE(V) \
+  INSTANCE_TYPE_LIST_SINGLE(V)           \
+  V(BigInt, BIGINT_TYPE)                 \
   V(FixedArrayExact, FIXED_ARRAY_TYPE)
 
-#define INSTANCE_TYPE_CHECKERS_RANGE(V)           \
-  TORQUE_INSTANCE_CHECKERS_RANGE_FULLY_DEFINED(V) \
-  TORQUE_INSTANCE_CHECKERS_RANGE_ONLY_DECLARED(V)
+#define INSTANCE_TYPE_CHECKERS_RANGE(V)                  \
+  INSTANCE_TYPE_LIST_RANGE(V)                            \
+  V(CallableJSFunction, FIRST_CALLABLE_JS_FUNCTION_TYPE, \
+    LAST_CALLABLE_JS_FUNCTION_TYPE)
 
 #define INSTANCE_TYPE_CHECKERS_CUSTOM(V) \
   V(AbstractCode)                        \
+  V(ConsString)                          \
+  V(CppHeapPointerWrapperObject)         \
+  V(ExternalOneByteString)               \
   V(ExternalString)                      \
+  V(ExternalTwoByteString)               \
   V(FreeSpaceOrFiller)                   \
   V(GcSafeCode)                          \
-  V(InternalizedString)
+  V(InternalizedString)                  \
+  V(JSApiWrapperObject)                  \
+  V(MaybeReadOnlyJSObject)               \
+  V(PropertyDictionary)                  \
+  V(SeqOneByteString)                    \
+  V(SeqString)                           \
+  V(SeqTwoByteString)                    \
+  V(SlicedString)                        \
+  V(ThinString)
 
 #define INSTANCE_TYPE_CHECKERS(V)  \
   INSTANCE_TYPE_CHECKERS_SINGLE(V) \
@@ -46,6 +58,11 @@ namespace InstanceTypeChecker {
   V8_INLINE bool Is##Type(Tagged<Map> map);
 
 INSTANCE_TYPE_CHECKERS(IS_TYPE_FUNCTION_DECL)
+
+V8_INLINE constexpr bool IsOneByteString(InstanceType instance_type);
+V8_INLINE bool IsOneByteString(Tagged<Map> map_object);
+V8_INLINE constexpr bool IsTwoByteString(InstanceType instance_type);
+V8_INLINE bool IsTwoByteString(Tagged<Map> map_object);
 
 #undef IS_TYPE_FUNCTION_DECL
 
@@ -62,16 +79,29 @@ constexpr Tagged_t kNonJsReceiverMapLimit =
         RootIndex::kFirstJSReceiverMapRoot)] &
     ~0xFFF;
 
+// Maps for strings allocated as the first maps in r/o space, so their lower
+// bound is zero.
+constexpr Tagged_t kStringMapLowerBound = 0;
+// If we have a receiver and need to distinguish whether it is a string or not,
+// it suffices to check whether it is less-than-equal to the following value.
+constexpr Tagged_t kStringMapUpperBound =
+    StaticReadOnlyRoot::kThinOneByteStringMap;
+
+#define ASSERT_IS_LAST_STRING_MAP(instance_type, size, name, Name) \
+  static_assert(StaticReadOnlyRoot::k##Name##Map <= kStringMapUpperBound);
+STRING_TYPE_LIST(ASSERT_IS_LAST_STRING_MAP)
+#undef ASSERT_IS_LAST_STRING_MAP
+
 // For performance, the limit is chosen to be encodable as an Arm64
 // constant. See Assembler::IsImmAddSub in assembler-arm64.cc.
-//
+static constexpr Tagged_t kMaxFastImmediateConstantArm64 = 0xfff;
 // If this assert fails, then you have perturbed the allocation pattern in
 // Heap::CreateReadOnlyHeapObjects. Currently this limit is ensured to exist by
 // allocating the first JSReceiver map in RO space a sufficiently large distance
 // away from the last non-JSReceiver map.
 static_assert(kNonJsReceiverMapLimit != 0 &&
               is_uint12(kNonJsReceiverMapLimit >> 12) &&
-              ((kNonJsReceiverMapLimit & 0xFFF) == 0));
+              ((kNonJsReceiverMapLimit & kMaxFastImmediateConstantArm64) == 0));
 
 #else
 

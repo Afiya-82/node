@@ -4,6 +4,11 @@
 
 #include "src/objects/turboshaft-types.h"
 
+extern enum AbortReason { kTurboshaftTypeAssertionFailed, ...}
+
+extern macro Abort(constexpr AbortReason): never;
+
+@cppScope('TurboshaftFloatSpecialValues')
 bitfield struct TurboshaftFloatSpecialValues extends uint32 {
   nan: bool: 1 bit;
   minus_zero: bool: 1 bit;
@@ -11,37 +16,30 @@ bitfield struct TurboshaftFloatSpecialValues extends uint32 {
 }
 
 @abstract
+@cppObjectLayoutDefinition
 extern class TurboshaftType extends HeapObject {}
 
-@generateBodyDescriptor
-@generateUniqueMap
-@generateFactoryFunction
+@abstract
+@cppObjectLayoutDefinition
 extern class TurboshaftWord32Type extends TurboshaftType {}
 
-@generateBodyDescriptor
-@generateUniqueMap
-@generateFactoryFunction
+@cppObjectLayoutDefinition
 extern class TurboshaftWord32RangeType extends TurboshaftWord32Type {
   from: uint32;
   to: uint32;
 }
 
-@generateBodyDescriptor
-@generateUniqueMap
-@generateFactoryFunction
+@cppObjectLayoutDefinition
 extern class TurboshaftWord32SetType extends TurboshaftWord32Type {
   const set_size: uint32;
   elements[set_size]: uint32;
 }
 
-@generateBodyDescriptor
-@generateUniqueMap
-@generateFactoryFunction
+@abstract
+@cppObjectLayoutDefinition
 extern class TurboshaftWord64Type extends TurboshaftType {}
 
-@generateBodyDescriptor
-@generateUniqueMap
-@generateFactoryFunction
+@cppObjectLayoutDefinition
 extern class TurboshaftWord64RangeType extends TurboshaftWord64Type {
   from_high: uint32;
   from_low: uint32;
@@ -49,34 +47,27 @@ extern class TurboshaftWord64RangeType extends TurboshaftWord64Type {
   to_low: uint32;
 }
 
-@generateBodyDescriptor
-@generateUniqueMap
-@generateFactoryFunction
+@cppObjectLayoutDefinition
 extern class TurboshaftWord64SetType extends TurboshaftWord64Type {
   const set_size: uint32;
   elements_high[set_size]: uint32;
   elements_low[set_size]: uint32;
 }
 
-@generateBodyDescriptor
-@generateUniqueMap
-@generateFactoryFunction
+@abstract
+@cppObjectLayoutDefinition
 extern class TurboshaftFloat64Type extends TurboshaftType {
   special_values: TurboshaftFloatSpecialValues;
 }
 
-@generateBodyDescriptor
-@generateUniqueMap
-@generateFactoryFunction
+@cppObjectLayoutDefinition
 extern class TurboshaftFloat64RangeType extends TurboshaftFloat64Type {
   _padding: uint32;
   min: float64;
   max: float64;
 }
 
-@generateBodyDescriptor
-@generateUniqueMap
-@generateFactoryFunction
+@cppObjectLayoutDefinition
 extern class TurboshaftFloat64SetType extends TurboshaftFloat64Type {
   const set_size: uint32;
   elements[set_size]: float64;
@@ -125,7 +116,7 @@ macro TestTurboshaftWord64Type(
               valueHigh, valueLow, range.to_high, range.to_low) <= 0;
       const isWrapping =
           CompareUint64HighLow(
-              range.from_high, range.from_low, range.to_high, range.to_low) < 0;
+              range.from_high, range.from_low, range.to_high, range.to_low) > 0;
 
       return (isWrapping && (greaterThanOrEqualFrom || lessThanOrEqualTo)) ||
           (greaterThanOrEqualFrom && lessThanOrEqualTo);
@@ -183,7 +174,7 @@ builtin CheckTurboshaftWord32Type(
   Print('Node id', nodeId);
   Print('Actual value', Convert<Number>(value));
   Print('Expected type', expectedType);
-  unreachable;
+  Abort(AbortReason::kTurboshaftTypeAssertionFailed);
 }
 
 builtin CheckTurboshaftWord64Type(
@@ -198,7 +189,7 @@ builtin CheckTurboshaftWord64Type(
   Print('Actual value (high)', Convert<Number>(valueHigh));
   Print('Actual vlaue (low)', Convert<Number>(valueLow));
   Print('Expected type', expectedType);
-  unreachable;
+  Abort(AbortReason::kTurboshaftTypeAssertionFailed);
 }
 
 // Builtin needs custom interface descriptor to allow float32 argument type.
@@ -215,7 +206,7 @@ builtin CheckTurboshaftFloat32Type(
   Print('Node id', nodeId);
   Print('Actual value', v);
   Print('Expected type', expectedType);
-  unreachable;
+  Abort(AbortReason::kTurboshaftTypeAssertionFailed);
 }
 
 // Builtin needs custom interface descriptor to allow float64 argument type.
@@ -231,19 +222,86 @@ builtin CheckTurboshaftFloat64Type(
   Print('Node id', nodeId);
   Print('Actual value', value);
   Print('Expected type', expectedType);
-  unreachable;
+  Abort(AbortReason::kTurboshaftTypeAssertionFailed);
 }
 
 @customInterfaceDescriptor
-builtin DebugPrintWordPtr(
-    implicit context: Context)(value: uintptr): Undefined {
-  Print('DebugPrint (word): ', value);
+builtin DebugPrintWord32(
+    implicit context: Context)(prefix: String|Smi, value: uint32): Undefined {
+  typeswitch (prefix) {
+    case (Smi): {
+      Print(kCStringNull, value);
+    }
+    case (s: String): {
+      Print(s, value);
+    }
+  }
+  return Undefined;
+}
+
+@customInterfaceDescriptor
+builtin DebugPrintWord64(
+    implicit context: Context)(prefix: String|Smi, value: uint64): Undefined {
+  if constexpr (Is64()) {
+    typeswitch (prefix) {
+      case (Smi): {
+        Print(kCStringNull, value);
+      }
+      case (s: String): {
+        Print(s, value);
+      }
+    }
+    return Undefined;
+  } else {
+    // Not supported on 32 bit.
+    unreachable;
+  }
+}
+
+@customInterfaceDescriptor
+builtin DebugPrintFloat32(
+    implicit context: Context)(prefix: String|Smi, value: float32): Undefined {
+  typeswitch (prefix) {
+    case (Smi): {
+      Print(kCStringNull, value);
+    }
+    case (s: String): {
+      Print(s, value);
+    }
+  }
   return Undefined;
 }
 
 @customInterfaceDescriptor
 builtin DebugPrintFloat64(
-    implicit context: Context)(value: float64): Undefined {
-  Print('DebugPrint (float64): ', value);
+    implicit context: Context)(prefix: String|Smi, value: float64): Undefined {
+  typeswitch (prefix) {
+    case (Smi): {
+      Print(kCStringNull, value);
+    }
+    case (s: String): {
+      Print(s, value);
+    }
+  }
+  return Undefined;
+}
+
+builtin DebugPrintObject(
+    implicit context: Context)(prefix: String|Smi, value: Object): Undefined {
+  typeswitch (prefix) {
+    case (Smi): {
+      typeswitch (value) {
+        case (s: String): {
+          PrintStringSimple(s);
+        }
+        case (Object): {
+          Print(kCStringNull, value);
+        }
+      }
+    }
+    case (s: String): {
+      Print(s, value);
+    }
+  }
   return Undefined;
 }

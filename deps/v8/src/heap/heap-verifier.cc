@@ -2,23 +2,30 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#ifdef VERIFY_HEAP
+
 #include "src/heap/heap-verifier.h"
 
+#include <optional>
+
 #include "include/v8-locker.h"
+#include "src/base/logging.h"
 #include "src/codegen/assembler-inl.h"
 #include "src/codegen/reloc-info.h"
 #include "src/common/globals.h"
 #include "src/execution/isolate.h"
 #include "src/heap/array-buffer-sweeper.h"
-#include "src/heap/basic-memory-chunk.h"
+#include "src/heap/base-page.h"
 #include "src/heap/combined-heap.h"
 #include "src/heap/ephemeron-remembered-set.h"
+#include "src/heap/heap-layout-inl.h"
+#include "src/heap/heap-visitor-inl.h"
 #include "src/heap/heap-write-barrier-inl.h"
 #include "src/heap/heap.h"
 #include "src/heap/large-spaces.h"
 #include "src/heap/memory-chunk-layout.h"
+#include "src/heap/memory-chunk.h"
 #include "src/heap/new-spaces.h"
-#include "src/heap/objects-visiting-inl.h"
 #include "src/heap/paged-spaces.h"
 #include "src/heap/read-only-heap.h"
 #include "src/heap/read-only-spaces.h"
@@ -30,7 +37,10 @@
 #include "src/objects/slots-inl.h"
 #include "src/objects/string-table.h"
 
-#ifdef VERIFY_HEAP
+#if V8_ENABLE_WEBASSEMBLY
+#include "src/wasm/wasm-export-wrapper-cache.h"
+#endif  // V8_ENABLE_WEBASSEMBLY
+
 namespace v8 {
 namespace internal {
 
@@ -43,7 +53,7 @@ thread_local Tagged<HeapObject> pending_layout_change_object =
 class VerifySmisVisitor final : public RootVisitor {
  public:
   void VisitRootPointers(Root root, const char* description,
-                         FullObjectSlot start, FullObjectSlot end) override {
+                         FullObjectSlot start, FullObjectSlot end) final {
     for (FullObjectSlot current = start; current < end; ++current) {
       CHECK(IsSmi(*current));
     }
@@ -55,11 +65,11 @@ class VerifySmisVisitor final : public RootVisitor {
 // point into the heap to a location that has a map pointer at its first word.
 // Caveat: Heap::Contains is an approximation because it can return true for
 // objects in a heap space but above the allocation pointer.
-class VerifyPointersVisitor : public ObjectVisitorWithCageBases,
+class VerifyPointersVisitor : public HeapVisitor<VerifyPointersVisitor>,
                               public RootVisitor {
  public:
   V8_INLINE explicit VerifyPointersVisitor(Heap* heap)
-      : ObjectVisitorWithCageBases(heap), heap_(heap) {}
+      : HeapVisitor(heap), heap_(heap) {}
 
   void VisitPointers(Tagged<HeapObject> host, ObjectSlot start,
                      ObjectSlot end) override;
@@ -74,9 +84,9 @@ class VerifyPointersVisitor : public ObjectVisitorWithCageBases,
 
   void VisitRootPointers(Root root, const char* description,
                          FullObjectSlot start, FullObjectSlot end) override;
-  void VisitRootPointers(Root root, const char* description,
-                         OffHeapObjectSlot start,
-                         OffHeapObjectSlot end) override;
+  void VisitCompressedRootPointers(Root root, const char* description,
+                                   OffHeapObjectSlot start,
+                                   OffHeapObjectSlot end) override;
   void VisitMapPointer(Tagged<HeapObject> host) override;
 
  protected:
@@ -105,7 +115,7 @@ void VerifyPointersVisitor::VisitPointers(Tagged<HeapObject> host,
 
 void VerifyPointersVisitor::VisitInstructionStreamPointer(
     Tagged<Code> host, InstructionStreamSlot slot) {
-  Object maybe_code = slot.load(code_cage_base());
+  Tagged<Object> maybe_code = slot.load(code_cage_base());
   Tagged<HeapObject> code;
   // The slot might contain smi during Code creation.
   if (maybe_code.GetHeapObject(&code)) {
@@ -122,35 +132,42 @@ void VerifyPointersVisitor::VisitRootPointers(Root root,
   VerifyPointersImpl(start, end);
 }
 
-void VerifyPointersVisitor::VisitRootPointers(Root root,
-                                              const char* description,
-                                              OffHeapObjectSlot start,
-                                              OffHeapObjectSlot end) {
+void VerifyPointersVisitor::VisitCompressedRootPointers(Root root,
+                                                        const char* description,
+                                                        OffHeapObjectSlot start,
+                                                        OffHeapObjectSlot end) {
   VerifyPointersImpl(start, end);
 }
 
 void VerifyPointersVisitor::VisitMapPointer(Tagged<HeapObject> host) {
-  VerifyHeapObjectImpl(host->map(cage_base()));
+  VerifyHeapObjectImpl(host->map());
 }
 
 void VerifyPointersVisitor::VerifyHeapObjectImpl(
     Tagged<HeapObject> heap_object) {
   CHECK(IsValidHeapObject(heap_, heap_object));
-  CHECK(IsMap(heap_object->map(cage_base())));
+  if (IsInaccessible(heap_object)) return;
+  CHECK(IsMap(heap_object->map()));
+  // Heap::InToPage() is not available with sticky mark-bits.
+  CHECK_IMPLIES(
+      !v8_flags.sticky_mark_bits && HeapLayout::InYoungGeneration(heap_object),
+      Heap::InToPage(heap_object));
 }
 
 void VerifyPointersVisitor::VerifyCodeObjectImpl(
     Tagged<HeapObject> heap_object) {
   CHECK(IsValidCodeObject(heap_, heap_object));
-  CHECK(IsMap(heap_object->map(cage_base())));
-  CHECK(heap_object->map(cage_base())->instance_type() ==
-        INSTRUCTION_STREAM_TYPE);
+  CHECK(IsMap(heap_object->map()));
+  CHECK_EQ(heap_object->map()->instance_type(), INSTRUCTION_STREAM_TYPE);
 }
 
 template <typename TSlot>
 void VerifyPointersVisitor::VerifyPointersImpl(TSlot start, TSlot end) {
   for (TSlot slot = start; slot < end; ++slot) {
     typename TSlot::TObject object = slot.load(cage_base());
+#ifdef V8_ENABLE_DIRECT_HANDLE
+    if (object.ptr() == kTaggedNullAddress) continue;
+#endif
     Tagged<HeapObject> heap_object;
     if (object.GetHeapObject(&heap_object)) {
       VerifyHeapObjectImpl(heap_object);
@@ -164,11 +181,11 @@ void VerifyPointersVisitor::VerifyPointersImpl(TSlot start, TSlot end) {
 void VerifyPointersVisitor::VerifyPointers(Tagged<HeapObject> host,
                                            MaybeObjectSlot start,
                                            MaybeObjectSlot end) {
-  // If this DCHECK fires then you probably added a pointer field
+  // If this CHECK fires then you probably added a pointer field
   // to one of objects in DATA_ONLY_VISITOR_ID_LIST. You can fix
   // this by moving that object to POINTER_VISITOR_ID_LIST.
-  DCHECK_EQ(ObjectFields::kMaybePointers,
-            Map::ObjectFieldsFrom(host->map(cage_base())->visitor_id()));
+  CHECK_EQ(ObjectFields::kMaybePointers,
+           Map::ObjectFieldsFrom(host->map()->visitor_id()));
   VerifyPointersImpl(start, end);
 }
 
@@ -181,7 +198,7 @@ void VerifyPointersVisitor::VisitCodeTarget(Tagged<InstructionStream> host,
 
 void VerifyPointersVisitor::VisitEmbeddedPointer(Tagged<InstructionStream> host,
                                                  RelocInfo* rinfo) {
-  VerifyHeapObjectImpl(rinfo->target_object(cage_base()));
+  VerifyHeapObjectImpl(rinfo->target_object());
 }
 
 class VerifyReadOnlyPointersVisitor : public VerifyPointersVisitor {
@@ -211,16 +228,18 @@ class VerifySharedHeapObjectVisitor : public VerifyPointersVisitor {
   explicit VerifySharedHeapObjectVisitor(Heap* heap)
       : VerifyPointersVisitor(heap),
         shared_space_(heap->shared_space()),
-        shared_lo_space_(heap->shared_lo_space()) {
-    DCHECK_NOT_NULL(shared_space_);
-    DCHECK_NOT_NULL(shared_lo_space_);
+        shared_trusted_space_(heap->shared_trusted_space()),
+        shared_lo_space_(heap->shared_lo_space()),
+        shared_trusted_lo_space_(heap->shared_trusted_lo_space()) {
+    CHECK_NOT_NULL(shared_space_);
+    CHECK_NOT_NULL(shared_lo_space_);
   }
 
  protected:
   void VerifyPointers(Tagged<HeapObject> host, MaybeObjectSlot start,
                       MaybeObjectSlot end) override {
     if (!host.is_null()) {
-      Map map = host->map();
+      Tagged<Map> map = host->map();
       CHECK(ReadOnlyHeap::Contains(map) || shared_space_->Contains(map));
     }
     VerifyPointersVisitor::VerifyPointers(host, start, end);
@@ -228,16 +247,22 @@ class VerifySharedHeapObjectVisitor : public VerifyPointersVisitor {
     for (MaybeObjectSlot current = start; current < end; ++current) {
       Tagged<HeapObject> heap_object;
       if ((*current).GetHeapObject(&heap_object)) {
+        MemoryChunk* chunk = MemoryChunk::FromHeapObject(heap_object);
+        CHECK(chunk->InReadOnlySpace() || chunk->InWritableSharedSpace());
         CHECK(ReadOnlyHeap::Contains(heap_object) ||
               shared_space_->Contains(heap_object) ||
-              shared_lo_space_->Contains(heap_object));
+              shared_lo_space_->Contains(heap_object) ||
+              shared_trusted_space_->Contains(heap_object) ||
+              shared_trusted_lo_space_->Contains(heap_object));
       }
     }
   }
 
  private:
   SharedSpace* shared_space_;
+  SharedTrustedSpace* shared_trusted_space_;
   SharedLargeObjectSpace* shared_lo_space_;
+  SharedTrustedLargeObjectSpace* shared_trusted_lo_space_;
 };
 
 class HeapVerification final : public SpaceVerificationVisitor {
@@ -251,9 +276,12 @@ class HeapVerification final : public SpaceVerificationVisitor {
 
  private:
   void VerifySpace(BaseSpace* space);
+#ifdef V8_ENABLE_SANDBOX
+  void VerifyPointerTables();
+#endif
 
-  void VerifyPage(const BasicMemoryChunk* chunk) final;
-  void VerifyPageDone(const BasicMemoryChunk* chunk) final;
+  void VerifyPage(const BasePage* chunk) final;
+  void VerifyPageDone(const BasePage* chunk) final;
 
   void VerifyObject(Tagged<HeapObject> object) final;
   void VerifyObjectMap(Tagged<HeapObject> object);
@@ -266,7 +294,6 @@ class HeapVerification final : public SpaceVerificationVisitor {
   NewSpace* new_space() const { return heap_->new_space(); }
   OldSpace* old_space() const { return heap_->old_space(); }
   SharedSpace* shared_space() const { return heap_->shared_space(); }
-
   CodeSpace* code_space() const { return heap_->code_space(); }
   LargeObjectSpace* lo_space() const { return heap_->lo_space(); }
   SharedLargeObjectSpace* shared_lo_space() const {
@@ -274,6 +301,16 @@ class HeapVerification final : public SpaceVerificationVisitor {
   }
   CodeLargeObjectSpace* code_lo_space() const { return heap_->code_lo_space(); }
   NewLargeObjectSpace* new_lo_space() const { return heap_->new_lo_space(); }
+  TrustedSpace* trusted_space() const { return heap_->trusted_space(); }
+  SharedTrustedSpace* shared_trusted_space() const {
+    return heap_->shared_trusted_space();
+  }
+  TrustedLargeObjectSpace* trusted_lo_space() const {
+    return heap_->trusted_lo_space();
+  }
+  SharedTrustedLargeObjectSpace* shared_trusted_lo_space() const {
+    return heap_->shared_trusted_lo_space();
+  }
 
   Isolate* isolate() const { return isolate_; }
   Heap* heap() const { return heap_; }
@@ -285,8 +322,8 @@ class HeapVerification final : public SpaceVerificationVisitor {
   Heap* const heap_;
   Isolate* const isolate_;
   const PtrComprCageBase cage_base_;
-  base::Optional<AllocationSpace> current_space_identity_;
-  base::Optional<const BasicMemoryChunk*> current_chunk_;
+  std::optional<AllocationSpace> current_space_identity_;
+  std::optional<const BasePage*> current_chunk_;
 };
 
 void HeapVerification::Verify() {
@@ -298,7 +335,8 @@ void HeapVerification::Verify() {
   SafepointScope safepoint_scope(isolate(), safepoint_kind);
   HandleScope scope(isolate());
 
-  heap()->MakeHeapIterable();
+  heap()->MakeHeapIterable(CompleteSweepingReason::kTesting);
+  heap()->FreeLinearAllocationAreas();
 
   // TODO(v8:13257): Currently we don't iterate through the stack conservatively
   // when verifying the heap.
@@ -308,14 +346,27 @@ void HeapVerification::Verify() {
 
   if (!isolate()->context().is_null() &&
       !isolate()->raw_native_context().is_null()) {
-    Object normalized_map_cache =
+    Tagged<Object> normalized_map_cache =
         isolate()->raw_native_context()->normalized_map_cache();
 
     if (IsNormalizedMapCache(normalized_map_cache)) {
-      NormalizedMapCache::cast(normalized_map_cache)
+      Cast<NormalizedMapCache>(normalized_map_cache)
           ->NormalizedMapCacheVerify(isolate());
     }
   }
+
+#if V8_ENABLE_WEBASSEMBLY
+  // wasm_canonical_rtts holds weak references to maps or (strong) undefined.
+  Tagged<WeakFixedArray> canonical_rtts = heap()->wasm_canonical_rtts();
+  const uint32_t canonical_rtts_len = canonical_rtts->ulength().value();
+  for (uint32_t i = 0, e = canonical_rtts_len; i < e; ++i) {
+    Tagged<MaybeObject> maybe_rtt = canonical_rtts->get(i);
+    if (maybe_rtt.IsCleared()) continue;
+    CHECK(maybe_rtt.IsWeak());
+    CHECK(IsMap(maybe_rtt.GetHeapObjectAssumeWeak()));
+  }
+  wasm::WasmExportWrapperCache::Verify(heap());
+#endif  // V8_ENABLE_WEBASSEMBLY
 
   // The heap verifier can't deal with partially deserialized objects, so
   // disable it if a deserializer is active.
@@ -337,12 +388,45 @@ void HeapVerification::Verify() {
   VerifySpace(shared_lo_space());
   VerifySpace(code_lo_space());
 
+  VerifySpace(trusted_space());
+  VerifySpace(shared_trusted_space());
+  VerifySpace(trusted_lo_space());
+  VerifySpace(shared_trusted_lo_space());
+
   isolate()->string_table()->VerifyIfOwnedBy(isolate());
+
+#ifdef V8_ENABLE_SANDBOX
+  VerifyPointerTables();
+#endif
 
 #if DEBUG
   heap()->VerifyCommittedPhysicalMemory();
 #endif  // DEBUG
 }
+
+#ifdef V8_ENABLE_SANDBOX
+void HeapVerification::VerifyPointerTables() {
+  isolate()->external_pointer_table().Verify(
+      isolate(), heap()->young_external_pointer_space());
+  isolate()->external_pointer_table().Verify(
+      isolate(), heap()->old_external_pointer_space());
+  isolate()->external_pointer_table().Verify(
+      isolate(), heap()->read_only_external_pointer_space());
+  isolate()->cpp_heap_pointer_table().Verify(isolate(),
+                                             heap()->cpp_heap_pointer_space());
+  isolate()->trusted_pointer_table().Verify(isolate(),
+                                            heap()->trusted_pointer_space());
+  isolate()->trusted_pointer_table().Verify(
+      isolate(), heap()->read_only_trusted_pointer_space());
+  if (isolate()->has_shared_trusted_pointer_table()) {
+    isolate()->shared_trusted_pointer_table().Verify(
+        isolate(), isolate()->shared_trusted_pointer_space());
+  }
+
+  isolate()->js_dispatch_table().Verify(isolate(),
+                                        heap()->js_dispatch_table_space());
+}
+#endif
 
 void HeapVerification::VerifySpace(BaseSpace* space) {
   if (!space) return;
@@ -351,25 +435,33 @@ void HeapVerification::VerifySpace(BaseSpace* space) {
   current_space_identity_.reset();
 }
 
-void HeapVerification::VerifyPage(const BasicMemoryChunk* chunk) {
+void HeapVerification::VerifyPage(const BasePage* chunk_metadata) {
+  const MemoryChunk* chunk = chunk_metadata->Chunk();
+
   CHECK(!current_chunk_.has_value());
-  CHECK(!chunk->IsFlagSet(Page::PAGE_NEW_OLD_PROMOTION));
-  if (V8_SHARED_RO_HEAP_BOOL && chunk->InReadOnlySpace()) {
-    CHECK_NULL(chunk->owner());
+#ifndef V8_ENABLE_STICKY_MARK_BITS_BOOL
+  CHECK(!chunk->IsFromPage());
+#endif
+  CHECK(!chunk_metadata->will_be_promoted());
+  CHECK(!chunk_metadata->is_quarantined());
+  CHECK_EQ(chunk_metadata->is_evacuation_candidate(),
+           chunk->IsEvacuationCandidate());
+  if (chunk->InReadOnlySpace()) {
+    CHECK_NULL(chunk_metadata->owner());
   } else {
-    CHECK_EQ(chunk->heap(), heap());
-    CHECK_EQ(chunk->owner()->identity(), current_space_identity());
+    CHECK_EQ(chunk_metadata->heap(), heap());
+    CHECK_EQ(chunk_metadata->owner()->identity(), current_space_identity());
   }
-  current_chunk_ = chunk;
+  current_chunk_ = chunk_metadata;
 }
 
-void HeapVerification::VerifyPageDone(const BasicMemoryChunk* chunk) {
+void HeapVerification::VerifyPageDone(const BasePage* chunk) {
   CHECK_EQ(chunk, *current_chunk_);
   current_chunk_.reset();
 }
 
 void HeapVerification::VerifyObject(Tagged<HeapObject> object) {
-  CHECK_EQ(BasicMemoryChunk::FromHeapObject(object), *current_chunk_);
+  CHECK_EQ(BasePage::FromHeapObject(isolate(), object), *current_chunk_);
 
   // Verify object map.
   VerifyObjectMap(object);
@@ -391,20 +483,29 @@ void HeapVerification::VerifyOutgoingPointers(Tagged<HeapObject> object) {
   switch (current_space_identity()) {
     case RO_SPACE: {
       VerifyReadOnlyPointersVisitor visitor(heap());
-      object->Iterate(cage_base_, &visitor);
+      visitor.Visit(object);
       break;
     }
 
     case SHARED_SPACE:
-    case SHARED_LO_SPACE: {
+    case SHARED_TRUSTED_SPACE:
+    case SHARED_LO_SPACE:
+    case SHARED_TRUSTED_LO_SPACE: {
       VerifySharedHeapObjectVisitor visitor(heap());
-      object->Iterate(cage_base_, &visitor);
+      visitor.Visit(object);
       break;
     }
 
-    default: {
+    case NEW_SPACE:
+    case OLD_SPACE:
+    case TRUSTED_SPACE:
+    case CODE_SPACE:
+    case LO_SPACE:
+    case NEW_LO_SPACE:
+    case CODE_LO_SPACE:
+    case TRUSTED_LO_SPACE: {
       VerifyPointersVisitor visitor(heap());
-      object->Iterate(cage_base_, &visitor);
+      visitor.Visit(object);
       break;
     }
   }
@@ -413,15 +514,17 @@ void HeapVerification::VerifyOutgoingPointers(Tagged<HeapObject> object) {
 void HeapVerification::VerifyObjectMap(Tagged<HeapObject> object) {
   // The first word should be a map, and we expect all map pointers to be
   // in map space or read-only space.
-  Map map = object->map(cage_base_);
-  CHECK(IsMap(map, cage_base_));
+  MapWord map_word = object->map_word(kRelaxedLoad);
+  CHECK(!map_word.IsForwardingAddress());
+  Tagged<Map> map = map_word.ToMap();
+  CHECK(IsMap(map));
   CHECK(ReadOnlyHeap::Contains(map) || old_space()->Contains(map) ||
         (shared_space() && shared_space()->Contains(map)));
 
-  if (Heap::InYoungGeneration(object)) {
+  if (HeapLayout::InYoungGeneration(object)) {
     // The object should not be code or a map.
-    CHECK(!IsMap(object, cage_base_));
-    CHECK(!IsAbstractCode(object, cage_base_));
+    CHECK(!IsMap(object));
+    CHECK(!IsAbstractCode(object));
   } else if (current_space_identity() == RO_SPACE) {
     CHECK(!IsExternalString(object));
     CHECK(!IsJSArrayBuffer(object));
@@ -433,20 +536,24 @@ void HeapVerification::VerifyReadOnlyHeap() {
   VerifySpace(read_only_space());
 }
 
-class SlotVerifyingVisitor : public ObjectVisitorWithCageBases {
+class SlotVerifyingVisitor : public HeapVisitor<SlotVerifyingVisitor> {
  public:
   SlotVerifyingVisitor(Isolate* isolate, std::set<Address>* untyped,
-                       std::set<std::pair<SlotType, Address>>* typed)
-      : ObjectVisitorWithCageBases(isolate), untyped_(untyped), typed_(typed) {}
+                       std::set<std::pair<SlotType, Address>>* typed,
+                       std::set<Address>* protected_pointer)
+      : HeapVisitor(isolate),
+        untyped_(untyped),
+        typed_(typed),
+        protected_(protected_pointer) {}
 
   virtual bool ShouldHaveBeenRecorded(Tagged<HeapObject> host,
-                                      MaybeObject target) = 0;
+                                      Tagged<MaybeObject> target) = 0;
 
   void VisitPointers(Tagged<HeapObject> host, ObjectSlot start,
                      ObjectSlot end) override {
 #ifdef DEBUG
     for (ObjectSlot slot = start; slot < end; ++slot) {
-      Object obj = slot.load(cage_base());
+      Tagged<Object> obj = slot.load(cage_base());
       CHECK(!MapWord::IsPacked(obj.ptr()) || !HasWeakHeapObjectTag(obj));
     }
 #endif  // DEBUG
@@ -464,17 +571,16 @@ class SlotVerifyingVisitor : public ObjectVisitorWithCageBases {
 
   void VisitInstructionStreamPointer(Tagged<Code> host,
                                      InstructionStreamSlot slot) override {
-    if (ShouldHaveBeenRecorded(
-            host, MaybeObject::FromObject(slot.load(code_cage_base())))) {
+    if (ShouldHaveBeenRecorded(host, slot.load(code_cage_base()))) {
       CHECK_GT(untyped_->count(slot.address()), 0);
     }
   }
 
   void VisitCodeTarget(Tagged<InstructionStream> host,
                        RelocInfo* rinfo) override {
-    Object target =
+    Tagged<Object> target =
         InstructionStream::FromTargetAddress(rinfo->target_address());
-    if (ShouldHaveBeenRecorded(host, MaybeObject::FromObject(target))) {
+    if (ShouldHaveBeenRecorded(host, target)) {
       CHECK(InTypedSet(SlotType::kCodeEntry, rinfo->pc()) ||
             (rinfo->IsInConstantPool() &&
              InTypedSet(SlotType::kConstPoolCodeEntry,
@@ -484,8 +590,8 @@ class SlotVerifyingVisitor : public ObjectVisitorWithCageBases {
 
   void VisitEmbeddedPointer(Tagged<InstructionStream> host,
                             RelocInfo* rinfo) override {
-    Object target = rinfo->target_object(cage_base());
-    if (ShouldHaveBeenRecorded(host, MaybeObject::FromObject(target))) {
+    Tagged<Object> target = rinfo->target_object();
+    if (ShouldHaveBeenRecorded(host, target)) {
       CHECK(InTypedSet(SlotType::kEmbeddedObjectFull, rinfo->pc()) ||
             InTypedSet(SlotType::kEmbeddedObjectCompressed, rinfo->pc()) ||
             (rinfo->IsInConstantPool() &&
@@ -495,6 +601,26 @@ class SlotVerifyingVisitor : public ObjectVisitorWithCageBases {
              InTypedSet(SlotType::kConstPoolEmbeddedObjectFull,
                         rinfo->constant_pool_entry_address())));
     }
+  }
+
+  void VisitProtectedPointer(Tagged<TrustedObject> host,
+                             ProtectedPointerSlot slot) override {
+    if (ShouldHaveBeenRecorded(host, slot.load())) {
+      CHECK_NOT_NULL(protected_);
+      CHECK_GT(protected_->count(slot.address()), 0);
+    }
+  }
+
+  void VisitProtectedPointer(Tagged<TrustedObject> host,
+                             ProtectedMaybeObjectSlot slot) override {
+    if (ShouldHaveBeenRecorded(host, slot.load())) {
+      CHECK_NOT_NULL(protected_);
+      CHECK_GT(protected_->count(slot.address()), 0);
+    }
+  }
+
+  void VisitMapPointer(Tagged<HeapObject> object) override {
+    VisitPointers(object, object->map_slot(), object->map_slot() + 1);
   }
 
  protected:
@@ -508,6 +634,7 @@ class SlotVerifyingVisitor : public ObjectVisitorWithCageBases {
   }
   std::set<Address>* untyped_;
   std::set<std::pair<SlotType, Address>>* typed_;
+  std::set<Address>* protected_;
 };
 
 class OldToNewSlotVerifyingVisitor : public SlotVerifyingVisitor {
@@ -516,32 +643,37 @@ class OldToNewSlotVerifyingVisitor : public SlotVerifyingVisitor {
       Isolate* isolate, std::set<Address>* untyped,
       std::set<std::pair<SlotType, Address>>* typed,
       EphemeronRememberedSet::TableMap* ephemeron_remembered_set)
-      : SlotVerifyingVisitor(isolate, untyped, typed),
+      : SlotVerifyingVisitor(isolate, untyped, typed, nullptr),
         ephemeron_remembered_set_(ephemeron_remembered_set) {}
 
   bool ShouldHaveBeenRecorded(Tagged<HeapObject> host,
-                              MaybeObject target) override {
-    DCHECK_IMPLIES(target->IsStrongOrWeak() && Heap::InYoungGeneration(target),
-                   Heap::InToPage(target));
-    return target->IsStrongOrWeak() && Heap::InYoungGeneration(target) &&
-           !Heap::InYoungGeneration(host);
+                              Tagged<MaybeObject> target) override {
+    // Heap::InToPage() is not available with sticky mark-bits.
+    CHECK_IMPLIES(!v8_flags.sticky_mark_bits && target.IsStrongOrWeak() &&
+                      HeapLayout::InYoungGeneration(target),
+                  Heap::InToPage(target));
+    return target.IsStrongOrWeak() && HeapLayout::InYoungGeneration(target) &&
+           !HeapLayout::InYoungGeneration(host);
   }
 
-  void VisitEphemeron(Tagged<HeapObject> host, int index, ObjectSlot key,
+  void VisitEphemeron(Tagged<HeapObject> host, int index, ObjectSlot key_slot,
                       ObjectSlot target) override {
     VisitPointer(host, target);
     if (v8_flags.minor_ms) return;
-    // Keys are handled separately and should never appear in this set.
-    CHECK(!InUntypedSet(key));
-    Object k = *key;
-    if (!ObjectInYoungGeneration(host) && ObjectInYoungGeneration(k)) {
-      EphemeronHashTable table = EphemeronHashTable::cast(host);
-      auto it = ephemeron_remembered_set_->find(table);
-      CHECK(it != ephemeron_remembered_set_->end());
-      int slot_index =
-          EphemeronHashTable::SlotToIndex(table.address(), key.address());
-      InternalIndex entry = EphemeronHashTable::IndexToEntry(slot_index);
-      CHECK(it->second.find(entry.as_int()) != it->second.end());
+    Tagged<EphemeronHashTable> table = i::Cast<EphemeronHashTable>(host);
+    if (!heap_->incremental_marking()->IsMajorMarking()) {
+      // Keys are handled separately and should never appear in this set.
+      CHECK(!InUntypedSet(key_slot));
+      Tagged<Object> k = *key_slot;
+      if (!HeapLayout::InYoungGeneration(host) &&
+          HeapLayout::InYoungGeneration(k)) {
+        auto it = ephemeron_remembered_set_->find(table);
+        CHECK(it != ephemeron_remembered_set_->end());
+        int slot_index = EphemeronHashTable::SlotToIndex(table.address(),
+                                                         key_slot.address());
+        InternalIndex entry = EphemeronHashTable::IndexToEntry(slot_index);
+        CHECK(it->second.find(entry.as_int()) != it->second.end());
+      }
     }
   }
 
@@ -552,18 +684,24 @@ class OldToNewSlotVerifyingVisitor : public SlotVerifyingVisitor {
 class OldToSharedSlotVerifyingVisitor : public SlotVerifyingVisitor {
  public:
   OldToSharedSlotVerifyingVisitor(Isolate* isolate, std::set<Address>* untyped,
-                                  std::set<std::pair<SlotType, Address>>* typed)
-      : SlotVerifyingVisitor(isolate, untyped, typed) {}
+                                  std::set<std::pair<SlotType, Address>>* typed,
+                                  std::set<Address>* protected_pointer)
+      : SlotVerifyingVisitor(isolate, untyped, typed, protected_pointer) {}
 
   bool ShouldHaveBeenRecorded(Tagged<HeapObject> host,
-                              MaybeObject target) override {
-    return target->IsStrongOrWeak() && Heap::InWritableSharedSpace(target) &&
-           !Heap::InYoungGeneration(host) && !host.InWritableSharedSpace();
+                              Tagged<MaybeObject> target) override {
+    Tagged<HeapObject> target_heap_object;
+    return target.GetHeapObject(&target_heap_object) &&
+           HeapLayout::InWritableSharedSpace(target_heap_object) &&
+           !(v8_flags.black_allocated_pages &&
+             TrustedHeapLayout::InBlackAllocatedPage(target_heap_object)) &&
+           !HeapLayout::InYoungGeneration(host) &&
+           !HeapLayout::InWritableSharedSpace(host);
   }
 };
 
 template <RememberedSetType direction>
-void CollectSlots(MemoryChunk* chunk, Address start, Address end,
+void CollectSlots(MutablePage* chunk, Address start, Address end,
                   std::set<Address>* untyped,
                   std::set<std::pair<SlotType, Address>>* typed) {
   RememberedSet<direction>::Iterate(
@@ -585,8 +723,12 @@ void CollectSlots(MemoryChunk* chunk, Address start, Address end,
 }
 
 // Helper class for collecting slot addresses.
-class SlotCollectingVisitor final : public ObjectVisitor {
+class SlotCollectingVisitor final : public HeapVisitor<SlotCollectingVisitor> {
  public:
+  explicit SlotCollectingVisitor(Isolate* isolate) : HeapVisitor(isolate) {}
+
+  static constexpr bool ShouldUseUncheckedCast() { return true; }
+
   void VisitPointers(Tagged<HeapObject> host, ObjectSlot start,
                      ObjectSlot end) override {
     VisitPointers(host, MaybeObjectSlot(start), MaybeObjectSlot(end));
@@ -616,7 +758,8 @@ class SlotCollectingVisitor final : public ObjectVisitor {
   }
 
   void VisitMapPointer(Tagged<HeapObject> object) override {
-  }  // do nothing by default
+    slots_.push_back(MaybeObjectSlot(object->map_slot()));
+  }
 
   int number_of_slots() { return static_cast<int>(slots_.size()); }
 
@@ -639,10 +782,10 @@ void HeapVerification::VerifyRememberedSetFor(Tagged<HeapObject> object) {
     return;
   }
 
-  MemoryChunk* chunk = MemoryChunk::FromHeapObject(object);
+  MutablePage* chunk = MutablePage::FromHeapObject(isolate(), object);
 
   Address start = object.address();
-  Address end = start + object->Size(cage_base_);
+  Address end = start + object->Size();
 
   std::set<Address> old_to_new;
   std::set<std::pair<SlotType, Address>> typed_old_to_new;
@@ -653,19 +796,31 @@ void HeapVerification::VerifyRememberedSetFor(Tagged<HeapObject> object) {
   OldToNewSlotVerifyingVisitor old_to_new_visitor(
       isolate(), &old_to_new, &typed_old_to_new,
       heap()->ephemeron_remembered_set()->tables());
-  object->IterateBody(cage_base_, &old_to_new_visitor);
+  old_to_new_visitor.Visit(object);
 
   std::set<Address> old_to_shared;
   std::set<std::pair<SlotType, Address>> typed_old_to_shared;
   CollectSlots<OLD_TO_SHARED>(chunk, start, end, &old_to_shared,
                               &typed_old_to_shared);
+  std::set<Address> trusted_to_shared_trusted;
+  CollectSlots<TRUSTED_TO_SHARED_TRUSTED>(chunk, start, end,
+                                          &trusted_to_shared_trusted, nullptr);
   OldToSharedSlotVerifyingVisitor old_to_shared_visitor(
-      isolate(), &old_to_shared, &typed_old_to_shared);
-  object->IterateBody(cage_base_, &old_to_shared_visitor);
+      isolate(), &old_to_shared, &typed_old_to_shared,
+      &trusted_to_shared_trusted);
+  old_to_shared_visitor.Visit(object);
 
-  if (object.InWritableSharedSpace()) {
+  if (!MemoryChunk::FromHeapObject(object)->Metadata()->is_trusted()) {
+    CHECK_NULL(chunk->slot_set<TRUSTED_TO_TRUSTED>());
+    CHECK_NULL(chunk->slot_set<TRUSTED_TO_SHARED_TRUSTED>());
+  }
+
+  if (HeapLayout::InWritableSharedSpace(object)) {
     CHECK_NULL(chunk->slot_set<OLD_TO_SHARED>());
     CHECK_NULL(chunk->typed_slot_set<OLD_TO_SHARED>());
+
+    CHECK_NULL(chunk->slot_set<TRUSTED_TO_SHARED_TRUSTED>());
+    CHECK_NULL(chunk->typed_slot_set<TRUSTED_TO_SHARED_TRUSTED>());
 
     CHECK_NULL(chunk->slot_set<OLD_TO_NEW>());
     CHECK_NULL(chunk->typed_slot_set<OLD_TO_NEW>());
@@ -674,7 +829,7 @@ void HeapVerification::VerifyRememberedSetFor(Tagged<HeapObject> object) {
     CHECK_NULL(chunk->typed_slot_set<OLD_TO_NEW_BACKGROUND>());
   }
 
-  if (Heap::InYoungGeneration(object)) {
+  if (!v8_flags.sticky_mark_bits && HeapLayout::InYoungGeneration(object)) {
     CHECK_NULL(chunk->slot_set<OLD_TO_NEW>());
     CHECK_NULL(chunk->typed_slot_set<OLD_TO_NEW>());
 
@@ -694,7 +849,7 @@ void HeapVerification::VerifyRememberedSetFor(Tagged<HeapObject> object) {
 
 // static
 void HeapVerifier::VerifyHeap(Heap* heap) {
-  TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.gc"), "V8.HeapVerification");
+  TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.gc"), "V8.HeapVerification");
   HeapVerification verifier(heap);
   verifier.Verify();
 }
@@ -708,16 +863,12 @@ void HeapVerifier::VerifyReadOnlyHeap(Heap* heap) {
 // static
 void HeapVerifier::VerifyObjectLayoutChangeIsAllowed(
     Heap* heap, Tagged<HeapObject> object) {
-  if (object.InWritableSharedSpace()) {
+  if (HeapLayout::InWritableSharedSpace(object)) {
     // Out of objects in the shared heap, only strings can change layout.
-    DCHECK(IsString(object));
+    CHECK(IsString(object));
     // Shared strings only change layout under GC, never concurrently.
     if (IsShared(object)) {
-      Isolate* isolate = heap->isolate();
-      Isolate* shared_space_isolate = isolate->is_shared_space_isolate()
-                                          ? isolate
-                                          : isolate->shared_space_isolate();
-      shared_space_isolate->global_safepoint()->AssertActive();
+      heap->isolate()->global_safepoint()->AssertActive();
     }
     // Non-shared strings in the shared heap are allowed to change layout
     // outside of GC like strings in non-shared heaps.
@@ -728,8 +879,11 @@ void HeapVerifier::VerifyObjectLayoutChangeIsAllowed(
 void HeapVerifier::SetPendingLayoutChangeObject(Heap* heap,
                                                 Tagged<HeapObject> object) {
   VerifyObjectLayoutChangeIsAllowed(heap, object);
-  DCHECK(pending_layout_change_object.is_null());
-  pending_layout_change_object = object;
+  {
+    DisableGCMole no_gcmole;
+    CHECK(pending_layout_change_object.is_null());
+    pending_layout_change_object = object;
+  }
 }
 
 // static
@@ -737,7 +891,8 @@ void HeapVerifier::VerifyObjectLayoutChange(Heap* heap,
                                             Tagged<HeapObject> object,
                                             Tagged<Map> new_map) {
   // Object layout changes are currently not supported on background threads.
-  DCHECK_NULL(LocalHeap::Current());
+  CHECK(heap->gc_state() == Heap::MARK_COMPACT ||
+        LocalHeap::Current()->is_main_thread());
 
   if (!v8_flags.verify_heap) return;
 
@@ -745,15 +900,18 @@ void HeapVerifier::VerifyObjectLayoutChange(Heap* heap,
 
   PtrComprCageBase cage_base(heap->isolate());
 
-  // Check that Heap::NotifyObjectLayoutChange was called for object transitions
-  // that are not safe for concurrent marking.
-  // If you see this check triggering for a freshly allocated object,
-  // use object->set_map_after_allocation() to initialize its map.
-  if (pending_layout_change_object.is_null()) {
-    VerifySafeMapTransition(heap, object, new_map);
-  } else {
-    DCHECK_EQ(pending_layout_change_object, object);
-    pending_layout_change_object = HeapObject();
+  {
+    DisableGCMole no_gcmole;
+    // Check that Heap::NotifyObjectLayoutChange was called for object
+    // transitions that are not safe for concurrent marking. If you see this
+    // check triggering for a freshly allocated object, use
+    // object->set_map_after_allocation() to initialize its map.
+    if (pending_layout_change_object.is_null()) {
+      VerifySafeMapTransition(heap, object, new_map);
+    } else {
+      CHECK_EQ(pending_layout_change_object, object);
+      pending_layout_change_object = {};
+    }
   }
 }
 
@@ -763,12 +921,12 @@ void HeapVerifier::VerifySafeMapTransition(Heap* heap,
                                            Tagged<Map> new_map) {
   PtrComprCageBase cage_base(heap->isolate());
 
-  if (IsJSObject(object, cage_base)) {
+  if (IsJSObject(object)) {
     // Without double unboxing all in-object fields of a JSObject are tagged.
     return;
   }
 
-  if (IsString(object, cage_base) &&
+  if (IsString(object) &&
       (new_map == ReadOnlyRoots(heap).thin_two_byte_string_map() ||
        new_map == ReadOnlyRoots(heap).thin_one_byte_string_map())) {
     // When transitioning a string to ThinString,
@@ -777,35 +935,31 @@ void HeapVerifier::VerifySafeMapTransition(Heap* heap,
     return;
   }
 
-  if (v8_flags.shared_string_table && IsString(object, cage_base) &&
+  if (v8_flags.shared_string_table && IsString(object) &&
       InstanceTypeChecker::IsInternalizedString(new_map->instance_type())) {
     // In-place internalization does not change a string's fields.
     //
     // When sharing the string table, the setting and re-setting of maps below
     // can race when there are parallel internalization operations, causing
-    // DCHECKs to fail.
+    // CHECKs to fail.
     return;
   }
 
   // Check that the set of slots before and after the transition match.
-  SlotCollectingVisitor old_visitor;
-  object->IterateFast(cage_base, &old_visitor);
-  MapWord old_map_word = object->map_word(cage_base, kRelaxedLoad);
-  // Temporarily set the new map to iterate new slots.
-  object->set_map_word(new_map, kRelaxedStore);
-  SlotCollectingVisitor new_visitor;
-  object->IterateFast(cage_base, &new_visitor);
-  // Restore the old map.
-  object->set_map_word(old_map_word.ToMap(), kRelaxedStore);
-  DCHECK_EQ(new_visitor.number_of_slots(), old_visitor.number_of_slots());
+  SlotCollectingVisitor old_visitor(heap->isolate());
+  old_visitor.Visit(object);
+  // Collect slots in object for new map.
+  SlotCollectingVisitor new_visitor(heap->isolate());
+  new_visitor.Visit(new_map, object);
+  CHECK_EQ(new_visitor.number_of_slots(), old_visitor.number_of_slots());
   for (int i = 0; i < new_visitor.number_of_slots(); i++) {
-    DCHECK_EQ(new_visitor.slot(i), old_visitor.slot(i));
+    CHECK_EQ(new_visitor.slot(i), old_visitor.slot(i));
   }
 #ifdef V8_EXTERNAL_CODE_SPACE
-  DCHECK_EQ(new_visitor.number_of_code_slots(),
-            old_visitor.number_of_code_slots());
+  CHECK_EQ(new_visitor.number_of_code_slots(),
+           old_visitor.number_of_code_slots());
   for (int i = 0; i < new_visitor.number_of_code_slots(); i++) {
-    DCHECK_EQ(new_visitor.code_slot(i), old_visitor.code_slot(i));
+    CHECK_EQ(new_visitor.code_slot(i), old_visitor.code_slot(i));
   }
 #endif  // V8_EXTERNAL_CODE_SPACE
 }
