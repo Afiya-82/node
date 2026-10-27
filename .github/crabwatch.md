@@ -1,1 +1,0 @@
-[![Crabwatch](https://github.com/rust-lang/blog.rust-lang.org/actions/workflows/required/rust-lang/crabwatch/.github/workflows/crabwatch.yml/badge.svg)](https://github.com/rust-lang/blog.rust-lang.org/actions/workflows/required/rust-lang/crabwatch/.github/workflows/crabwatch.yml)
